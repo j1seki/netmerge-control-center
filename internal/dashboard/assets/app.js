@@ -121,21 +121,47 @@ async function api(path, opts) {
   return payload.data;
 }
 
-function toast(kind, message, details) {
+function toast(kind, message, details, code) {
   const box = $("#toast");
+  const info = code ? codeInfo(code) : null;
   const n = h("div", { class: "notice " + kind, onclick: () => n.remove() },
+    code ? h("div", { class: "small mono dim" }, code) : null,
     h("strong", null, message),
+    info ? h("div", { class: "small", style: "margin-top:4px" }, info.meaning) : null,
+    info && info.fix ? h("div", { class: "small dim", style: "margin-top:4px" }, info.fix) : null,
     details ? h("div", { class: "small mono", style: "margin-top:4px" }, typeof details === "string" ? details : JSON.stringify(details, null, 2)) : null,
-    h("div", { class: "small dim", style: "margin-top:6px" }, "click to dismiss"));
+    h("div", { class: "row", style: "margin-top:6px" },
+      h("button", {
+        class: "btn secondary small", onclick: (ev) => {
+          ev.stopPropagation();
+          const body = ["code: " + (code || "(none)"), "message: " + message,
+            info ? "meaning: " + info.meaning : "", info && info.fix ? "next step: " + info.fix : "",
+            details ? "details: " + (typeof details === "string" ? details : JSON.stringify(details)) : ""].filter(Boolean).join("\n");
+          navigator.clipboard.writeText(body).then(() => toast("ok", "Error details copied."), () => toast("warn", "Clipboard access was refused by the browser."));
+        }
+      }, "Copy error details"),
+      h("span", { class: "small dim", style: "margin-left:8px" }, "click to dismiss")));
   box.append(n);
-  setTimeout(() => n.remove(), 9000);
+  setTimeout(() => n.remove(), 12000);
 }
 
 async function guard(fn, busy) {
   if (busy) busy.disabled = true;
   try { return await fn(); }
-  catch (e) { toast("bad", e.message || "request failed", e.details ? JSON.stringify(e.details) : e.code); }
+  catch (e) { toast("bad", e.message || "request failed", e.details ? JSON.stringify(e.details) : null, e.code); }
   finally { if (busy) busy.disabled = false; }
+}
+
+/* The application's error-code registry, so a code is never left unexplained. Loaded once at
+   startup; until it arrives, toasts simply show the code without the prose. */
+let codeRegistry = null;
+function codeInfo(code) { return codeRegistry ? codeRegistry[code] : null; }
+async function loadCodeRegistry() {
+  try {
+    const d = await api("/api/errcodes");
+    codeRegistry = {};
+    (d.codes || []).forEach((e) => { codeRegistry[e.code] = e; });
+  } catch (e) { /* the dashboard works without it; only the prose is missing */ }
 }
 
 /* ---------- shared state ---------- */
@@ -755,6 +781,15 @@ async function pollDiagJob() {
   $("#diagCancel").disabled = true;
   if (j.status !== "done") {
     prog.append(h("div", { class: "notice bad" }, "Run " + j.id + " ended as " + j.status + (j.error ? ": " + j.error : ".")));
+    // A stopped run keeps the checks that had finished. Show them, clearly labelled: a check with
+    // no result here did not pass, it did not run, and the two must not look alike.
+    const partial = j.diag && j.diag.result;
+    const partialResults = (partial && partial.results) || [];
+    if (partialResults.length) {
+      prog.append(h("div", { class: "notice warn" },
+        "What follows is the partial set: the " + partialResults.length + " check(s) that had already finished when the run stopped. Every other check has no result - not a pass - and can be run again."));
+      renderDiagResults(partial);
+    }
     return;
   }
   lastDiag = j.diag.result;
@@ -784,7 +819,19 @@ function renderDiagResults(run) {
       panel.append(h("div", { class: "small mt" }, h("strong", null, "Could not establish:")), h("ul", { class: "small est" }, res.inconclusive.map((x) => h("li", null, x))));
     }
     if (res.errorCodes && res.errorCodes.length) {
-      panel.append(h("div", { class: "mt" }, res.errorCodes.map((c) => h("span", { class: "tag warn", style: "margin-right:6px" }, c))));
+      const codes = h("div", { class: "mt" });
+      res.errorCodes.forEach((c) => {
+        const info = codeInfo(c);
+        codes.append(h("span", { class: "tag warn", style: "margin-right:6px", title: info ? info.meaning : c }, c));
+      });
+      panel.append(codes);
+      res.errorCodes.forEach((c) => {
+        const info = codeInfo(c);
+        if (!info) return;
+        panel.append(h("div", { class: "small", style: "margin-top:2px" },
+          h("span", { class: "mono" }, c), " — ", info.meaning,
+          info.fix ? h("span", { class: "dim" }, " " + info.fix) : null));
+      });
     }
     if (res.nextSteps && res.nextSteps.length) {
       panel.append(h("div", { class: "small mt" }, h("strong", null, "Next steps:")), h("ul", { class: "small est" }, res.nextSteps.map((x) => h("li", null, x))));
@@ -941,6 +988,11 @@ function renderSettings() {
       h("strong", null, "The settings file could not be read. "),
       settingsView.loadError,
       h("div", { class: "small" }, "The defaults are shown; the file on disk has not been changed. Fix the problem and reload.")));
+  }
+  if (settingsView.stale) {
+    box.append(h("div", { class: "notice info" },
+      h("strong", null, "This settings file was written by a different build. "),
+      settingsView.staleReason));
   }
   box.append(h("div", { class: "small dim" }, "File: ", h("span", { class: "mono" }, settingsView.path), settingsView.existed ? "" : " (not created yet — defaults are in use)"));
 
@@ -1101,3 +1153,4 @@ $("#logQuery").addEventListener("input", () => { clearTimeout(logDebounce); logD
 $("#logLevel").addEventListener("change", () => { logCursor = 0; pollLogs(); });
 
 stateLoop();
+loadCodeRegistry();

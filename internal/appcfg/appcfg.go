@@ -270,6 +270,22 @@ type Problems []string
 
 func (p Problems) Error() string { return strings.Join(p, "; ") }
 
+// Stale reports whether the file on disk was written by a different build than this one, and
+// says so in words. A stale file is usable - Load fills in what is missing and Validate only
+// rejects what it must - but the user is told, because a value that behaved one way in another
+// build can behave differently now, and because saving rewrites the file in this build's format.
+func (c Config) Stale() (bool, string) {
+	switch {
+	case c.Version == 0:
+		return true, fmt.Sprintf("the settings file does not record a format version, so it was written by a build older than this one (current version %d); the known fields still load, and saving rewrites the file in the current format", ConfigVersion)
+	case c.Version < ConfigVersion:
+		return true, fmt.Sprintf("the settings file records format version %d and this build writes version %d; the known fields still load, and saving rewrites the file in the current format", c.Version, ConfigVersion)
+	case c.Version > ConfigVersion:
+		return true, fmt.Sprintf("the settings file records format version %d and this build only knows version %d, so it was written by a newer build; the fields shown are the ones this build understands, and saving would drop what it does not (open the file and copy anything you need first)", c.Version, ConfigVersion)
+	}
+	return false, ""
+}
+
 // ValidAddress reports whether the configured dashboard address is syntactically usable.
 // It does not decide reachability; the server refuses non-loopback binds separately.
 func (c Config) ListenAddress() (string, error) {

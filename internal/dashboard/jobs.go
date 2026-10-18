@@ -244,6 +244,18 @@ func (s *Server) startJob(kind string, fn func(ctx context.Context) (any, error)
 			// partial result (which is what a cancelled diagnostics run does) is still cancelled.
 			j.status = JobCancelled
 			j.err = "cancelled"
+			// The checks that had finished are real evidence, and they are kept: the job's status
+			// says the run was cancelled, and the UI labels what is shown as the partial set.
+			// Discarding them would hide facts the run had already established.
+			switch r := v.(type) {
+			case diag.RunResult:
+				rr := r
+				j.diag = &rr
+			case *diag.RunResult:
+				if r != nil {
+					j.diag = r
+				}
+			}
 		case err != nil:
 			j.status = JobFailed
 			j.err = err.Error()

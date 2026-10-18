@@ -16,7 +16,9 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,7 @@ import (
 	"net-merge/internal/appcfg"
 	"net-merge/internal/diag"
 	"net-merge/internal/diagreport"
+	"net-merge/internal/errcodes"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
 	"net-merge/internal/state"
@@ -146,7 +149,15 @@ func (f *fakeDiag) RunAll(ctx context.Context, opts diag.Options) diag.RunResult
 		select {
 		case <-f.release:
 		case <-ctx.Done():
-			return diag.RunResult{Summary: "cancelled", Results: nil}
+			// A cancelled run returns the checks that had already finished, which is what the
+			// real registry does: cancellation stops the run, it does not erase its evidence.
+			return diag.RunResult{
+				Summary: "cancelled after 1 of 2 checks",
+				Results: []diag.Result{{
+					ID: "platform.info", Title: "Platform", Category: "platform", Status: "info",
+					Summary: "the check that finished before the cancel",
+				}},
+			}
 		}
 	}
 	return f.result
@@ -949,6 +960,20 @@ func TestCancelAJob(t *testing.T) {
 	if final["status"] != "cancelled" {
 		t.Errorf("a cancelled job ended as %v", final["status"])
 	}
+	// The finished checks survive the cancellation: a stopped run must not look like a run that
+	// found nothing, and the UI labels what it shows as the partial set.
+	d, _ := final["diag"].(map[string]any)
+	if d == nil {
+		t.Fatalf("a cancelled run discarded its partial result: %v", final)
+	}
+	run, _ := d["result"].(map[string]any)
+	results, _ := run["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("partial results = %v, want the one check that had finished", run["results"])
+	}
+	if first, _ := results[0].(map[string]any); first["id"] != "platform.info" {
+		t.Errorf("partial result[0] = %v", results[0])
+	}
 }
 
 func TestStartServesOnAnEphemeralPortWithATokenURL(t *testing.T) {
@@ -1066,3 +1091,149 @@ func waitJob(t *testing.T, h *harness, path string) map[string]any {
 }
 
 var _ = diagreport.DefaultLimits // keep the import honest if the export test changes
+
+// --- error-code explanations and stale settings ------------------------------------------------
+
+// TestEveryFailCodeIsRegistered scans this package's own sources for every fail(...) call and
+// checks the code it passes is in internal/errcodes. The scan is the test: a new error path that
+// forgets its explanation fails here instead of reaching a user as a bare identifier.
+func TestEveryFailCodeIsRegistered(t *testing.T) {
+	re := regexp.MustCompile(`(?s)fail\(w,[^,]*?,\s*"([a-z0-9_]+)"`)
+	found := map[string]bool{}
+	for _, name := range []string{"api.go", "dashboard.go", "export.go", "jobs.go"} {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+			code := m[1]
+			found[code] = true
+			if entry, ok := errcodes.Lookup(code); !ok {
+				t.Errorf("%s returns %q, which is not registered in internal/errcodes; add it there with a meaning and a next step", name, code)
+			} else if entry.Meaning == "" {
+				t.Errorf("%s returns %q, registered with no meaning", name, code)
+			}
+		}
+	}
+	// A floor, so a change to the call shape cannot silently turn the scan into a no-op.
+	if len(found) < 15 {
+		t.Errorf("the scan found only %d codes; it is probably no longer matching the fail(...) calls", len(found))
+	}
+}
+
+func TestErrorCodesEndpointExplains(t *testing.T) {
+	h := newHarness(t)
+	code, data := h.data("GET", "/api/errcodes", nil)
+	if code != 200 {
+		t.Fatalf("GET /api/errcodes = %d", code)
+	}
+	rows, _ := data["codes"].([]any)
+	if len(rows) < 50 {
+		t.Fatalf("codes = %d rows, want the full registry", len(rows))
+	}
+	byCode := map[string]map[string]any{}
+	for _, r := range rows {
+		m, _ := r.(map[string]any)
+		if m == nil {
+			t.Fatalf("a registry row is not an object: %v", r)
+		}
+		byCode[m["code"].(string)] = m
+	}
+	// The codes the dashboard itself returns must be present with prose, and refusals must say
+	// what to do next.
+	for _, want := range []string{"dashboard_confirm_required", "dashboard_unauthorized", "dashboard_ttl_op_failed"} {
+		m, ok := byCode[want]
+		if !ok {
+			t.Errorf("%s is missing from /api/errcodes", want)
+			continue
+		}
+		if m["meaning"].(string) == "" {
+			t.Errorf("%s has no meaning", want)
+		}
+		if m["fix"].(string) == "" {
+			t.Errorf("%s has no suggested next step", want)
+		}
+	}
+	if m, ok := byCode["dashboard_confirm_required"]; ok && m["kind"] != string(errcodes.KindSafety) {
+		t.Errorf("dashboard_confirm_required kind = %v, want safety (it is a deliberate refusal, not a defect)", m["kind"])
+	}
+}
+
+func TestAPIErrorsCarryTheirExplanation(t *testing.T) {
+	h := newHarness(t)
+	// The confirm gate is a real refusal the UI meets: apply without confirm.
+	status, errCode := h.errCode("POST", "/api/ttl/apply", map[string]any{"dryRun": false, "confirm": false})
+	if status != http.StatusBadRequest || errCode != "dashboard_confirm_required" {
+		t.Fatalf("apply without confirm = %d %s", status, errCode)
+	}
+	_, b := h.call("POST", "/api/ttl/apply", map[string]any{"dryRun": false, "confirm": false})
+	var env struct {
+		Error *apiError
+	}
+	if err := json.Unmarshal(b, &env); err != nil || env.Error == nil {
+		t.Fatalf("response is not an error envelope: %.200s", b)
+	}
+	if env.Error.Explanation == "" || env.Error.Fix == "" {
+		t.Errorf("the refusal came back without its explanation: %+v", env.Error)
+	}
+	if !strings.Contains(env.Error.Explanation, "confirm") {
+		t.Errorf("explanation does not read like prose about the refusal: %q", env.Error.Explanation)
+	}
+}
+
+func TestStaleSettingsAreSurfaced(t *testing.T) {
+	h := newHarness(t)
+	// A file written by a newer build: schema and version valid, version above this build's.
+	cfg := appcfg.Default()
+	cfg.Version = appcfg.ConfigVersion + 1
+	dir := filepath.Join(h.dir, "cfg")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(appcfg.Path(dir), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, data := h.data("GET", "/api/settings", nil)
+	if code != 200 {
+		t.Fatalf("GET /api/settings = %d", code)
+	}
+	if data["stale"] != true {
+		t.Fatalf("a version-%d file was not reported as stale: %v", cfg.Version, data["stale"])
+	}
+	why, _ := data["staleReason"].(string)
+	if !strings.Contains(why, "newer build") {
+		t.Errorf("staleReason = %q, want it to explain a newer-build file", why)
+	}
+	if data["loadError"] != nil && data["loadError"] != "" {
+		t.Errorf("a version-%d file is usable, not a load error: %v", cfg.Version, data["loadError"])
+	}
+
+	// A current file is not stale.
+	cfg.Version = appcfg.ConfigVersion
+	b, _ = json.Marshal(cfg)
+	if err := os.WriteFile(appcfg.Path(dir), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, data = h.data("GET", "/api/settings", nil)
+	if data["stale"] == true {
+		t.Errorf("a current settings file was reported stale: %v", data["staleReason"])
+	}
+}
+
+// TestAppJSSyntax parses the UI's JavaScript with a real runtime when one is on PATH. It skips
+// (loudly) when there is none: the project must build on a machine without Node, but when Node
+// is present a typo in the UI is caught here instead of surfacing as a blank page in a browser.
+func TestAppJSSyntax(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; skipping the optional JavaScript syntax check")
+	}
+	if out, err := exec.Command(node, "--check", "assets/app.js").CombinedOutput(); err != nil {
+		t.Fatalf("node --check assets/app.js failed (%v):\n%s", err, out)
+	}
+}

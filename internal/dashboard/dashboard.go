@@ -40,6 +40,7 @@ import (
 
 	"net-merge/internal/appcfg"
 	"net-merge/internal/diag"
+	"net-merge/internal/errcodes"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
 	"net-merge/internal/state"
@@ -420,6 +421,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/export/{id}", s.handleExportGet)
 	mux.HandleFunc("POST /api/export/save", s.handleExportSave)
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
+	mux.HandleFunc("GET /api/errcodes", s.handleErrorCodes)
 	mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
 	mux.HandleFunc("PUT /api/settings", s.handleSettingsPut)
 
@@ -503,12 +505,15 @@ func (s *Server) tokenMatches(v string) bool {
 
 // --- response helpers -------------------------------------------------------------------------
 
-// apiError is the error half of every response, shaped so the UI can show a code, a sentence
-// and the details underneath.
+// apiError is the error half of every response, shaped so the UI can show a code, a sentence,
+// the details underneath, and - from the shared registry - what the code means and what to do
+// about it. A code with no registered explanation is still shown; it is never invented.
 type apiError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Details any    `json:"details,omitempty"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+	Details     any    `json:"details,omitempty"`
+	Explanation string `json:"explanation,omitempty"`
+	Fix         string `json:"fix,omitempty"`
 }
 
 type apiResponse struct {
@@ -524,9 +529,14 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 }
 
 func fail(w http.ResponseWriter, status int, code, msg string, details any) {
+	e := &apiError{Code: code, Message: msg, Details: details}
+	if entry, ok := errcodes.Lookup(code); ok {
+		e.Explanation = entry.Meaning
+		e.Fix = entry.Fix
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	writeJSONBody(w, apiResponse{OK: false, Error: &apiError{Code: code, Message: msg, Details: details}})
+	writeJSONBody(w, apiResponse{OK: false, Error: e})
 }
 
 func writeJSONBody(w http.ResponseWriter, v any) {

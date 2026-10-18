@@ -24,6 +24,7 @@ import (
 	"net-merge/internal/appcfg"
 	"net-merge/internal/diag"
 	"net-merge/internal/engine"
+	"net-merge/internal/errcodes"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
 	"net-merge/internal/platform"
@@ -462,6 +463,13 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": evs, "cursor": cursor})
 }
 
+// handleErrorCodes serves the application's code registry: for every code a person can meet,
+// what it means and what to do about it. The UI shows these beside errors and in the
+// diagnostics results, so a code is never left as a bare identifier.
+func (s *Server) handleErrorCodes(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"codes": errcodes.All()})
+}
+
 // --- settings ---------------------------------------------------------------------------------
 
 type settingsView struct {
@@ -470,6 +478,8 @@ type settingsView struct {
 	LoadError    string        `json:"loadError,omitempty"`
 	LoadExisted  bool          `json:"existed"`
 	ProfileOrder []string      `json:"profileOrder"`
+	Stale        bool          `json:"stale,omitempty"`
+	StaleReason  string        `json:"staleReason,omitempty"`
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -485,6 +495,11 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, string(p.ID))
 	}
 	view.ProfileOrder = ids
+	// A file written by another build is usable, but the user is told: the settings page is the
+	// only place where a silent format change would otherwise go unnoticed.
+	if stale, why := cfg.Stale(); stale {
+		view.Stale, view.StaleReason = true, why
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 
