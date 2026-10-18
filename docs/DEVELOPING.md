@@ -57,6 +57,9 @@ nix build                           # Linux, with Nix: result/bin/net-merge
 scripts\build.ps1 -Version 0.1.0    # dist\: net-merge.exe, net-merge-tray.exe, installer, portable zip
 ```
 
+For the full packaging picture — the cross-compile path that builds the two exes on a non-Windows
+host, what each artifact is, and what is verified where — see [RELEASING.md](RELEASING.md).
+
 `wintun.dll` is not in the repo: `scripts\fetch-wintun.ps1` downloads it and verifies its SHA-256 and its
 WireGuard LLC signature. To run from source, put it next to the exe:
 

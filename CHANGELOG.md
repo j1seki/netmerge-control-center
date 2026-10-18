@@ -6,6 +6,27 @@ entry here before pushing a version tag.
 ## [Unreleased]
 
 ### Added
+- **NetMerge Control Center.** The tray and engine now also serve a local dashboard
+  (`net-merge dashboard`): live per-adapter state and throughput, routing, a Windows-native
+  TTL / hop-limit manager, a diagnostics centre, searchable logs and settings — one binary, no
+  extra runtime, loopback-only with a per-run access token. See
+  [docs/CONTROL-CENTER.md](docs/CONTROL-CENTER.md).
+  - **TTL / hop-limit manager** (Windows): inspects IPv4 TTL and IPv6 hop limit with their scope,
+    captures the original values before the first change, applies only after an explicit
+    confirmation, verifies each write by reading it back, and restores the captured originals
+    (`net-merge ttl restore`) — never an assumed default. Opt-in only; it never changes anything
+    because an adapter appeared. See
+    [docs/CONTROL-CENTER.md#ttl--hop-limit-manager](docs/CONTROL-CENTER.md#ttl--hop-limit-manager).
+  - **Diagnostics centre** (`net-merge diag`, or the dashboard's Diagnostics section): adapter
+    discovery, routes, DNS, IPv4/IPv6 connectivity, per-adapter reachability pinned to each
+    adapter's own interface, gateway, MTU, traceroute, UDP and more. Each check states what it
+    does *and does not* establish, rather than trusting an exit code. Export a redacted,
+    human-inspectable report for AI analysis — public IPs, MACs, serials and personal paths are
+    replaced, nothing is uploaded, no telemetry. See
+    [docs/ERROR-CODES.md](docs/ERROR-CODES.md).
+  - **Quality profiles** (`maximum-throughput`, `gaming-low-latency`, `fiber-preferred`,
+    `connection-reliability`, `custom`), applied at the next engine start, plus a per-link
+    reachability monitor that logs real state transitions.
 - **One-line install.** `curl -fsSL https://raw.githubusercontent.com/rohit267/net-merge/main/install.sh | sh` on
   macOS and Linux (it uses Homebrew, apt, dnf, zypper, apk or pacman when it can, the release tarball
   otherwise, and starts the tray), and `irm https://raw.githubusercontent.com/rohit267/net-merge/main/install.ps1 | iex`

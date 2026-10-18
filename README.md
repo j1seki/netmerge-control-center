@@ -342,8 +342,14 @@ More flags and details are in [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 - What changed in each version: [CHANGELOG.md](CHANGELOG.md)
 - How it works, building from source, tests: [docs/DEVELOPING.md](docs/DEVELOPING.md)
+- **The Control Center** — dashboard, TTL / hop-limit manager, diagnostics, quality profiles,
+  AI-ready export: [docs/CONTROL-CENTER.md](docs/CONTROL-CENTER.md)
+- Something not working: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Every error code is
+  explained in [docs/ERROR-CODES.md](docs/ERROR-CODES.md).
+- Packaging a Windows build (installer or portable, native or cross-compile): [docs/RELEASING.md](docs/RELEASING.md)
 - Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). Found a security problem? [SECURITY.md](SECURITY.md)
-- License: MIT, see `LICENSE`. Third-party parts: `THIRD-PARTY-NOTICES.md`.
+- License: MIT, see `LICENSE`. Third-party parts: `THIRD-PARTY-NOTICES.md` and
+  [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md).
 
 ## Support
 
