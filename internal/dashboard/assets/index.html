@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetMerge Control Center</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div id="app">
+  <aside>
+    <h1>NetMerge<br><span>Control Center</span></h1>
+    <div id="engineBadge"><span class="dim">engine…</span></div>
+    <nav id="nav">
+      <button data-view="overview" class="active">1 · Overview</button>
+      <button data-view="connections">2 · Connections</button>
+      <button data-view="routing">3 · Routing</button>
+      <button data-view="ttl">4 · TTL / Hop limit</button>
+      <button data-view="diag">5 · Diagnostics</button>
+      <button data-view="logs">6 · Logs</button>
+      <button data-view="settings">7 · Settings</button>
+    </nav>
+    <footer id="foot"></footer>
+  </aside>
+
+  <main>
+    <section id="view-overview" class="view active">
+      <h2>Overview</h2>
+      <p class="sub">Live state of every adapter and of the bonding engine, refreshed every few
+        seconds from one shared monitor. No demo values: what is not known is shown as unknown.</p>
+      <div id="ovCards" class="cards"></div>
+      <div id="ovWarnings"></div>
+      <div class="panel">
+        <h3>Links <span class="hint">link speed is what the hardware negotiated, not a throughput claim</span></h3>
+        <div id="ovLinks"></div>
+      </div>
+      <div class="panel">
+        <h3>Engine</h3>
+        <div id="ovEngine"></div>
+      </div>
+    </section>
+
+    <section id="view-connections" class="view">
+      <h2>Connections</h2>
+      <p class="sub">Per-adapter detail: identity, addressing, DNS, routing, counters and the
+        engine's use of each link, with the reason whenever a link is excluded.</p>
+      <div class="row between">
+        <div id="connCount" class="dim"></div>
+        <div class="row">
+          <button class="btn secondary" id="connRefresh">Take a fresh snapshot</button>
+        </div>
+      </div>
+      <div id="connBody" class="mt"></div>
+    </section>
+
+    <section id="view-routing" class="view">
+      <h2>Routing and profile</h2>
+      <p class="sub">Which profile is active, what it asks the engine for, and what the engine is
+        actually doing. A profile is a request expressed in real engine flags; the engine's own
+        status file is the truth about what happened.</p>
+      <div class="panel">
+        <h3>Active profile</h3>
+        <div id="routeProfile"></div>
+      </div>
+      <div class="panel">
+        <h3>Engine status</h3>
+        <div id="routeEngine"></div>
+      </div>
+      <div class="panel">
+        <h3>Cross-adapter observations</h3>
+        <div id="routeCross"></div>
+      </div>
+      <div class="panel">
+        <h3>Default routes</h3>
+        <div id="routeDefaults"></div>
+      </div>
+    </section>
+
+    <section id="view-ttl" class="view">
+      <h2>TTL / Hop limit</h2>
+      <p class="sub">The packet-header IPv4 TTL and IPv6 hop limit. These are unrelated to DNS
+        record TTLs or traceroute hop counts, which are shown separately and are not configurable
+        here. Nothing is written without an explicit preview and confirmation, and every change
+        captures the original value for restore first.</p>
+      <div class="row between">
+        <div id="ttlState" class="dim"></div>
+        <div class="row">
+          <button class="btn secondary" id="ttlReload">Reload current values</button>
+        </div>
+      </div>
+      <div id="ttlBody"></div>
+      <div class="panel">
+        <h3>Opt-in configuration <span class="hint">saved, never applied by itself</span></h3>
+        <div id="ttlConfig"></div>
+      </div>
+      <div class="panel">
+        <h3>Change history</h3>
+        <div id="ttlHistory"></div>
+      </div>
+    </section>
+
+    <section id="view-diag" class="view">
+      <h2>Diagnostics</h2>
+      <p class="sub">Each check states what its result does and does not establish. A command
+        that exited without error is never reported as success on its own.</p>
+      <div class="row between">
+        <div class="row">
+          <button class="btn" id="diagRunAll">Run all supported checks</button>
+          <button class="btn secondary" id="diagRunSel">Run selected</button>
+          <button class="btn secondary" id="diagCancel" disabled>Cancel</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="exportStart">Export diagnostics for AI analysis</button>
+        </div>
+      </div>
+      <div id="diagProgress" class="mt"></div>
+      <div id="diagResults"></div>
+      <div class="panel">
+        <h3>Available checks</h3>
+        <div id="diagChecks"></div>
+      </div>
+      <div class="panel hidden" id="exportPanel">
+        <h3>Export preview <span class="hint">inspect before sharing; nothing is uploaded</span></h3>
+        <div id="exportMeta"></div>
+        <div class="row spread">
+          <button class="btn secondary" id="exportSave">Save .txt and .json</button>
+          <button class="btn secondary" id="exportCopy">Copy JSON</button>
+        </div>
+        <div id="exportVisibility" class="mt"></div>
+        <pre id="exportText" class="mt"></pre>
+      </div>
+    </section>
+
+    <section id="view-logs" class="view">
+      <h2>Logs</h2>
+      <p class="sub">The in-memory event history. Rotating files on disk hold the same events
+        with the level the Settings section selects.</p>
+      <div class="row">
+        <label class="field">Level
+          <select id="logLevel">
+            <option value="debug">debug</option>
+            <option value="info" selected>info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label class="field" style="flex:1;min-width:240px">Search
+          <input type="text" id="logQuery" placeholder="code, message or detail; empty = live tail">
+        </label>
+        <label class="field"><span>&nbsp;</span>
+          <button class="btn secondary" id="logClearSearch">Clear</button>
+        </label>
+      </div>
+      <div id="logBody" class="mt"></div>
+    </section>
+
+    <section id="view-settings" class="view">
+      <h2>Settings</h2>
+      <p class="sub">Stored in a versioned file next to the application's state. Validation
+        lists every problem instead of silently keeping the good parts.</p>
+      <div id="settingsBody"></div>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+<script>window.NETMERGE_TOKEN = "{{TOKEN}}";</script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

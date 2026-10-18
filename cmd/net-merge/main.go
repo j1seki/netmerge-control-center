@@ -34,6 +34,11 @@ const usage = `net-merge: use all your network adapters at once.
   net-merge install    macOS: sudo net-merge install lets the tray start without a password
   net-merge version
 
+Control Center (see docs/CONTROL-CENTER.md):
+  net-merge dashboard  local dashboard: overview, connections, routing, TTL, diagnostics, logs, settings
+  net-merge diag       run the diagnostics on the command line (-json, -export DIR)
+  net-merge ttl        the IPv4 TTL / IPv6 hop-limit manager (inspect, preview, apply, restore, history)
+
 Flags for run/socks: -include "WiFi,Ethernet 3"  -weight "Name=3"  -auto-weight=false  -stats 5s
 `
 
@@ -255,6 +260,12 @@ func main() {
 		cmdSocks(args)
 	case "list":
 		cmdList(args)
+	case "dashboard":
+		cmdDashboard(args)
+	case "diag":
+		cmdDiag(args)
+	case "ttl":
+		cmdTTL(args)
 	case "cleanup":
 		cmdCleanup()
 	default:

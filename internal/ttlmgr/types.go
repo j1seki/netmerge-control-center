@@ -166,14 +166,14 @@ func ParseInterfaceSettingID(id SettingID) (f Family, index int, name string, ok
 
 // SettingRef identifies a setting without its value: enough to read, write or capture it.
 type SettingRef struct {
-	ID     SettingID
-	Kind   Kind
-	Family Family
-	Scope  Scope
+	ID     SettingID `json:"id"`
+	Kind   Kind      `json:"kind"`
+	Family Family    `json:"family"`
+	Scope  Scope     `json:"scope"`
 
 	// Interface is set only when Scope is ScopePerInterface.
-	Interface    string
-	InterfaceIdx int
+	Interface    string `json:"interface,omitempty"`
+	InterfaceIdx int    `json:"interfaceIdx,omitempty"`
 }
 
 // SystemRef returns the reference for a system-global packet-header setting.
@@ -217,15 +217,15 @@ type Setting struct {
 	// Value is the effective value, or nil when it is not configured or could not be read.
 	// It is a pointer on purpose: on Windows the relevant registry values are frequently
 	// absent, which means "use the built-in default", and that is NOT the same as zero.
-	Value *int
+	Value *int `json:"value"`
 
 	// ValueOrigin says where Value came from, e.g. "cmdlet", "registry", "os-default".
-	ValueOrigin string
+	ValueOrigin string `json:"valueOrigin,omitempty"`
 
 	// Writable reports whether this package can change the value, and WritableReason says
 	// why not when it cannot. Both are always populated so the UI never has to guess.
-	Writable       bool
-	WritableReason string
+	Writable       bool   `json:"writable"`
+	WritableReason string `json:"writableReason,omitempty"`
 }
 
 // Display renders the value for a UI or report, distinguishing "not configured" from a
@@ -259,16 +259,16 @@ type Observed struct {
 // are present, and because non-Windows hosts have no equivalent at all.
 type Capabilities struct {
 	// Platform is runtime.GOOS, carried so reports are self-describing.
-	Platform string
+	Platform string `json:"platform"`
 
 	// Supported is false when this host has no mechanism for the setting at all.
-	Supported bool
+	Supported bool `json:"supported"`
 
 	// Commands lists the inspected command capabilities, keyed by command name.
-	Commands []CommandCapability
+	Commands []CommandCapability `json:"commands,omitempty"`
 
 	// Notes are human-readable caveats shown in the UI and the export.
-	Notes []string
+	Notes []string `json:"notes,omitempty"`
 }
 
 // CommandCapability is the result of probing one external command for one parameter. The
