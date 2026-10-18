@@ -1,4 +1,4 @@
-package ttlmgr
+package execx
 
 // Tests for the real subprocess runner. They use ordinary system utilities (sleep, sh) and
 // verify that output, exit status, timeouts and cancellation are all reported rather than
@@ -129,5 +129,26 @@ func TestResultHelpers(t *testing.T) {
 	}
 	if !(Result{Started: true, TimedOut: true}).Failed() {
 		t.Error("a timeout must count as a failure")
+	}
+}
+
+func TestResultDetailTruncates(t *testing.T) {
+	r := Result{Started: true, Stdout: strings.Repeat("line\n", 20)}
+	if got := r.Detail(3); len(got) != 4 || !strings.Contains(got[3], "truncated") {
+		t.Errorf("Detail(3) = %#v, want three lines and a truncation note", got)
+	}
+	if got := r.Detail(0); len(got) != 20 {
+		t.Errorf("Detail(0) returned %d lines, want every non-empty line", len(got))
+	}
+}
+
+func TestFormatCommandQuotesOnlyWhenNeeded(t *testing.T) {
+	got := FormatCommand("powershell.exe", []string{"-Command", "Get-NetAdapter"})
+	if got != "powershell.exe -Command Get-NetAdapter" {
+		t.Errorf("FormatCommand() = %q", got)
+	}
+	got = FormatCommand("x", []string{"a b", "c"})
+	if got != "x 'a b' c" {
+		t.Errorf("FormatCommand() = %q, want the argument with a space quoted", got)
 	}
 }

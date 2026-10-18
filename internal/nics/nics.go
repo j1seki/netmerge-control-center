@@ -1,7 +1,6 @@
 package nics
 
 import (
-	"fmt"
 	"net"
 	"regexp"
 	"strings"
@@ -64,8 +63,8 @@ func DiscoverNicsDetailed(include []string, weights map[string]float64) ([]Nic, 
 			case info != nil && haveInfo && ai.virtual != "":
 				skip(ai.virtual)
 				continue
-			case info != nil && haveInfo && virtualDesc.MatchString(ai.desc):
-				skip(fmt.Sprintf("virtual/VPN adapter (%s)", ai.desc))
+			case info != nil && haveInfo && VirtualReason("", ai.desc) != "":
+				skip(VirtualReason("", ai.desc))
 				continue
 			}
 		}

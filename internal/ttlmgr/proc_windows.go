@@ -4,18 +4,9 @@ package ttlmgr
 
 import (
 	"errors"
-	"os/exec"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
-
-// prepareCommand stops Windows from flashing a console window for every probe and write. A
-// windowless build has no console to inherit, so without this each PowerShell invocation would
-// briefly steal focus, which would be visible and unpleasant during a diagnostic run.
-func prepareCommand(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-}
 
 // processAlive reports whether a process with the given pid is still running.
 //

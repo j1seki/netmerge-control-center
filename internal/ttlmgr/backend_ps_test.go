@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"net-merge/internal/execx"
 )
 
 type fakeRunner struct {
@@ -23,12 +25,12 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) Result {
 	f.mu.Lock()
-	f.calls = append(f.calls, formatCommand(name, args))
+	f.calls = append(f.calls, execx.FormatCommand(name, args))
 	f.mu.Unlock()
 	if f.runFn != nil {
 		return f.runFn(ctx, name, args...)
 	}
-	return Result{Command: formatCommand(name, args), Started: true}
+	return Result{Command: execx.FormatCommand(name, args), Started: true}
 }
 
 func (f *fakeRunner) LookPath(name string) (string, error) {

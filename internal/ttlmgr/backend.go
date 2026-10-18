@@ -4,135 +4,27 @@ import (
 	"context"
 	"os/exec"
 	"runtime"
-	"strings"
-	"time"
+
+	"net-merge/internal/execx"
 )
 
-// Result is everything that happened when an external command was run. It is a value rather
-// than an error return because a non-zero exit is data, not a transport failure: the exit
-// status, the output and the duration all belong in the change history and the exported
-// report, and a caller that only received an error would lose them.
-type Result struct {
-	Command  string        `json:"command"`
-	Stdout   string        `json:"stdout,omitempty"`
-	Stderr   string        `json:"stderr,omitempty"`
-	ExitCode int           `json:"exitCode"`
-	Started  bool          `json:"started"`
-	TimedOut bool          `json:"timedOut,omitempty"`
-	Duration time.Duration `json:"duration"`
-	Err      string        `json:"err,omitempty"`
-}
+// The TTL manager drives Windows command-line tools through the shared runner in
+// internal/execx. The names below are kept as aliases so the manager, its tests and anything
+// built on the package keep one vocabulary for "a command was run and here is what happened"
+// regardless of which layer ran it.
 
-// Failed reports whether the command did not complete successfully. A timeout counts as
-// failure even though the process may still have been running when it was killed.
-func (r Result) Failed() bool { return !r.Started || r.TimedOut || r.ExitCode != 0 || r.Err != "" }
+// Result is everything that happened when an external command was run.
+type Result = execx.Result
 
-// Output returns stdout and stderr together, which is what a diagnosis needs.
-func (r Result) Output() string {
-	switch {
-	case r.Stderr == "":
-		return r.Stdout
-	case r.Stdout == "":
-		return r.Stderr
-	default:
-		return r.Stdout + "\n" + r.Stderr
-	}
-}
+// Runner executes an external command; it is an interface so the TTL layer can be exercised
+// without a Windows host.
+type Runner = execx.Runner
 
-// FirstLine returns the most informative single line, used for compact history entries.
-func (r Result) FirstLine() string {
-	for _, line := range strings.Split(strings.TrimSpace(r.Output()), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return line
-		}
-	}
-	return ""
-}
+// ExecRunner is the Runner used outside tests.
+type ExecRunner = execx.ExecRunner
 
-// Runner executes an external command. It is an interface so the TTL layer can be exercised
-// without a Windows host, which is how the failure paths get tested at all: a fake runner can
-// return a refusal, a timeout, malformed output or a write that silently does nothing.
-type Runner interface {
-	// Run executes the command and always returns a Result describing what happened. It does
-	// not return an error: start failures and timeouts are reported inside the Result so no
-	// caller can accidentally drop the diagnostic detail.
-	Run(ctx context.Context, name string, args ...string) Result
-
-	// LookPath reports whether a command can be resolved, returning the path when it can.
-	LookPath(name string) (string, error)
-}
-
-// ExecRunner is the Runner used outside tests. It is deliberately thin: the caller owns the
-// timeout through ctx, and the output is captured verbatim because the report shows it.
-type ExecRunner struct {
-	// Timeout bounds a single command. It is a field so tests and unusual environments can
-	// change it, and it is always applied even when the caller supplies no deadline.
-	Timeout time.Duration
-}
-
-// NewExecRunner returns an ExecRunner with a sensible default timeout. Windows cmdlets are
-// slow to start (PowerShell module autoloading commonly costs 0.5-2 s), so the default is
-// generous enough to avoid a false timeout while still bounding a hung command.
-func NewExecRunner() *ExecRunner { return &ExecRunner{Timeout: 30 * time.Second} }
-
-// Run implements Runner.
-func (e *ExecRunner) Run(ctx context.Context, name string, args ...string) Result {
-	timeout := e.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	res := Result{Command: formatCommand(name, args)}
-	start := time.Now()
-	cmd := exec.CommandContext(ctx, name, args...)
-	prepareCommand(cmd) // platform-specific: no console window on Windows
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-
-	err := cmd.Run()
-	res.Duration = time.Since(start)
-	res.Stdout, res.Stderr = stdout.String(), stderr.String()
-	res.Started = true
-
-	switch {
-	case ctx.Err() == context.DeadlineExceeded:
-		res.TimedOut = true
-		res.ExitCode = -1
-		res.Err = "timed out after " + timeout.String()
-	case ctx.Err() == context.Canceled:
-		res.Err = "cancelled"
-		res.ExitCode = -1
-	case err != nil:
-		var ee *exec.ExitError
-		if ok := asExitError(err, &ee); ok {
-			// The process ran and exited non-zero: that is a result, not a start failure.
-			res.ExitCode = ee.ExitCode()
-		} else {
-			res.Started = false
-			res.ExitCode = -1
-			res.Err = err.Error()
-		}
-	}
-	return res
-}
-
-// LookPath implements Runner.
-func (e *ExecRunner) LookPath(name string) (string, error) {
-	return exec.LookPath(name)
-}
-
-// formatCommand renders a command the way a person would retype it, quoting only when needed.
-func formatCommand(name string, args []string) string {
-	parts := append([]string{name}, args...)
-	for i, p := range parts {
-		if strings.ContainsAny(p, " \t\"'") {
-			parts[i] = "'" + strings.ReplaceAll(p, "'", "''") + "'"
-		}
-	}
-	return strings.Join(parts, " ")
-}
+// NewExecRunner returns an ExecRunner with a sensible default timeout.
+func NewExecRunner() *execx.ExecRunner { return execx.NewExecRunner() }
 
 // Backend is the platform mechanism that reads and writes packet-header settings. Every
 // implementation states its own capabilities, because the honest answer to "can this host do
@@ -208,25 +100,13 @@ func (u *UnsupportedBackend) Unset(context.Context, SettingRef) error {
 		"No change was attempted, so nothing on this host was altered.")
 }
 
-// asExitError is a tiny indirection so the exec error type is unwrapped in one place.
-func asExitError(err error, target **exec.ExitError) bool {
-	ee, ok := err.(*exec.ExitError)
-	if ok {
-		*target = ee
-	}
-	return ok
-}
-
 // firstLine trims output to its first non-empty line so a report stays readable and a long
 // PowerShell transcript cannot swamp a history entry.
-func firstLine(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return line
-		}
-	}
-	return ""
-}
+func firstLine(s string) string { return execx.FirstLine(s) }
 
 // intPtr returns a pointer to a copy, so callers cannot alias a loop variable.
 func intPtr(v int) *int { return &v }
+
+// prepareCommand is kept for the platform tests; the implementation lives in execx so every
+// subprocess in the application is windowless on Windows for the same reason.
+func prepareCommand(cmd *exec.Cmd) { execx.PrepareCommand(cmd) }

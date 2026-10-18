@@ -4,12 +4,8 @@ package ttlmgr
 
 import (
 	"errors"
-	"os/exec"
 	"syscall"
 )
-
-// prepareCommand is a no-op away from Windows; there is no console-window problem to solve.
-func prepareCommand(*exec.Cmd) {}
 
 // processAlive reports whether a process with the given pid is still running. Signal 0 is the
 // portable liveness probe: it performs the permission check without delivering anything. Like
