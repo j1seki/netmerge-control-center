@@ -63,8 +63,10 @@ type EnginePrefs struct {
 	// Weights are fixed per-adapter weights (the engine's -weight). Present only when the
 	// profile pins weights; AutoWeight is the engine's -auto-weight.
 	Weights map[string]float64 `json:"weights,omitempty"`
-	// AutoWeight mirrors -auto-weight: weight adapters by measured throughput.
-	AutoWeight bool `json:"autoWeight"`
+	// AutoWeight mirrors -auto-weight: weight adapters by measured throughput. A pointer so
+	// "no opinion" (the engine's own default) is distinguishable from an explicit false; a
+	// plain bool would turn every unset field into "off", which is not what the profile said.
+	AutoWeight *bool `json:"autoWeight,omitempty"`
 	// IPv6 mirrors -ipv6: auto|on|off.
 	IPv6 string `json:"ipv6,omitempty"`
 	// MTU mirrors -mtu; 0 means "leave the engine default".
@@ -104,6 +106,12 @@ type Dashboard struct {
 	// IntervalMs is how often the monitor refreshes the shared snapshot the UI polls.
 	// The UI polls the cached snapshot, so this is the only rate that costs work.
 	IntervalMs int `json:"intervalMs"`
+	// HealthIntervalMs is how often the link-health probe runs: one TCP connect per
+	// adapter that can carry traffic, then a result cached for the page. 0 means the
+	// default; a negative value turns the probe off, and the page says it is off rather
+	// than showing nothing. It cannot be faster than the profile budget allows because it
+	// is the most expensive thing the dashboard does.
+	HealthIntervalMs int `json:"healthIntervalMs"`
 	// OpenBrowser asks the command to open the dashboard in the default browser on start.
 	OpenBrowser bool `json:"openBrowser"`
 }
@@ -193,9 +201,10 @@ func Default() Config {
 		ActiveProfile: ProfileThroughput,
 		Profiles:      map[ProfileID]Profile{},
 		Dashboard: Dashboard{
-			Listen:      "127.0.0.1:0",
-			IntervalMs:  1000,
-			OpenBrowser: true,
+			Listen:           "127.0.0.1:0",
+			IntervalMs:       1000,
+			HealthIntervalMs: 30000,
+			OpenBrowser:      true,
 		},
 		Logging: Logging{Level: "info", MaxBytes: 4 << 20, MaxFiles: 5, RingEvents: 2000},
 		Privacy: Privacy{
@@ -232,35 +241,38 @@ func builtinProfiles() []Profile {
 			ID:          ProfileThroughput,
 			Name:        "Maximum Throughput",
 			Description: "Use every eligible internet path and let the engine weight adapters by measured throughput. Per-connection balancing: separate connections spread across links; one TCP connection still uses one link.",
-			Engine:      EnginePrefs{AutoWeight: true, IPv6: "auto"},
+			Engine:      EnginePrefs{AutoWeight: Bool(true), IPv6: "auto"},
 			Monitor:     MonitorPrefs{ProbeLinkLatency: false},
 		},
 		{
 			ID:          ProfileGaming,
 			Name:        "Gaming / Low Latency",
 			Description: "Favour the healthy lower-latency path for interactive traffic. The engine balances per connection and does not break established connections; weights should be pinned to the link this profile favours.",
-			Engine:      EnginePrefs{AutoWeight: false, IPv6: "auto"},
+			Engine:      EnginePrefs{AutoWeight: Bool(false), IPv6: "auto"},
 			Monitor:     MonitorPrefs{ProbeLinkLatency: true, LatencyBudgetMs: 60, PreferLowerLatency: true},
 		},
 		{
 			ID:          ProfileFiber,
 			Name:        "Fiber Preferred",
 			Description: "Prefer the wired home fiber for ordinary traffic. Set the preferred adapter below; the others stay excluded unless you include them, and the TTL page is separate.",
-			Engine:      EnginePrefs{AutoWeight: false, IPv6: "auto"},
+			Engine:      EnginePrefs{AutoWeight: Bool(false), IPv6: "auto"},
 			Monitor:     MonitorPrefs{ProbeLinkLatency: true, LatencyBudgetMs: 100},
 		},
 		{
 			ID:          ProfileReliability,
 			Name:        "Connection Reliability",
 			Description: "Keep working links working: the engine already removes an adapter from new assignments when its probes fail and restores it after recovery. This profile watches health and reports transitions; auto-weighting is on so a degraded link contributes less.",
-			Engine:      EnginePrefs{AutoWeight: true, IPv6: "auto"},
+			Engine:      EnginePrefs{AutoWeight: Bool(true), IPv6: "auto"},
 			Monitor:     MonitorPrefs{ProbeLinkLatency: true, LatencyBudgetMs: 250},
 		},
 		{
 			ID:          ProfileCustom,
 			Name:        "Custom",
 			Description: "Your own include list, exclusions and weights. Nothing is assumed: what you set is what the engine gets.",
-			Engine:      EnginePrefs{AutoWeight: false, IPv6: "auto"},
+			// No opinion on auto-weighting: the engine's own default stands until the user
+			// sets this field. A plain false would silently turn weighting off.
+			Engine:  EnginePrefs{IPv6: "auto"},
+			Monitor: MonitorPrefs{},
 		},
 	}
 }
@@ -338,6 +350,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Dashboard.IntervalMs < 250 {
 		probs = append(probs, fmt.Sprintf("dashboard.intervalMs is %d, want >= 250", c.Dashboard.IntervalMs))
+	}
+	if c.Dashboard.HealthIntervalMs < -1 {
+		probs = append(probs, fmt.Sprintf("dashboard.healthIntervalMs is %d; use 0 for the default, -1 to disable, or a positive number of milliseconds", c.Dashboard.HealthIntervalMs))
+	}
+	if c.Dashboard.HealthIntervalMs > 0 && c.Dashboard.HealthIntervalMs < 5000 {
+		probs = append(probs, fmt.Sprintf("dashboard.healthIntervalMs is %d; a health probe every %d ms is more load than the result is worth (minimum 5000, or -1 to disable)", c.Dashboard.HealthIntervalMs, c.Dashboard.HealthIntervalMs))
 	}
 	if _, ok := parseLogLevel(c.Logging.Level); !ok {
 		probs = append(probs, fmt.Sprintf("logging.level %q is not debug, info, warn or error", c.Logging.Level))
@@ -443,6 +461,9 @@ func (c *Config) fillMissing() {
 	}
 	if c.Dashboard.IntervalMs == 0 {
 		c.Dashboard.IntervalMs = def.Dashboard.IntervalMs
+	}
+	if c.Dashboard.HealthIntervalMs == 0 {
+		c.Dashboard.HealthIntervalMs = def.Dashboard.HealthIntervalMs
 	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = def.Logging.Level
@@ -563,6 +584,41 @@ func (c *Config) Active() (Profile, bool) {
 	return p, ok
 }
 
+// Bool returns a pointer to v, for the tri-state EnginePrefs fields.
+func Bool(v bool) *bool { return &v }
+
+// Overlay is the engine configuration a profile contributes, in the engine's own vocabulary. A
+// nil or empty field means the profile has no opinion there and the engine's default (or the
+// user's own command-line flag) stands. It is what the launch path merges into unset flags, so
+// switching profile in the dashboard changes what the next engine start does.
+type Overlay struct {
+	Include    []string
+	Exclude    []string
+	Weights    map[string]float64
+	AutoWeight *bool
+	IPv6       string
+	MTU        int
+}
+
+// Overlay projects the profile's engine preferences. It copies the lists and the weight map so
+// a caller cannot mutate stored settings through the result.
+func (p Profile) Overlay() Overlay {
+	ov := Overlay{AutoWeight: p.Engine.AutoWeight, IPv6: p.Engine.IPv6, MTU: p.Engine.MTU}
+	if len(p.Engine.Include) > 0 {
+		ov.Include = append([]string(nil), p.Engine.Include...)
+	}
+	if len(p.Engine.Exclude) > 0 {
+		ov.Exclude = append([]string(nil), p.Engine.Exclude...)
+	}
+	if len(p.Engine.Weights) > 0 {
+		ov.Weights = make(map[string]float64, len(p.Engine.Weights))
+		for k, v := range p.Engine.Weights {
+			ov.Weights[k] = v
+		}
+	}
+	return ov
+}
+
 // EngineArgs renders the engine flags this profile maps to, for `net-merge run`. It is the
 // concrete answer to "what would this profile actually do", and the Routing section shows it
 // so a preference is never mistaken for a guarantee.
@@ -570,13 +626,11 @@ func (p Profile) EngineArgs() []string {
 	var args []string
 	if len(p.Engine.Include) > 0 {
 		args = append(args, "-include", strings.Join(p.Engine.Include, ","))
-	} else if len(p.Engine.Exclude) > 0 {
-		// The engine has no -exclude; the Control Center expresses it as an include list only
-		// when it can enumerate the adapters, which it does at launch time. Here we emit the
-		// weights and let the launch path fill the list in.
-		args = append(args, "-include", "<all except: "+strings.Join(p.Engine.Exclude, ", ")+">")
 	}
-	if !p.Engine.AutoWeight {
+	if len(p.Engine.Exclude) > 0 {
+		args = append(args, "-exclude", strings.Join(p.Engine.Exclude, ","))
+	}
+	if p.Engine.AutoWeight != nil && !*p.Engine.AutoWeight {
 		args = append(args, "-auto-weight=false")
 	}
 	for _, name := range sortedKeys(p.Engine.Weights) {

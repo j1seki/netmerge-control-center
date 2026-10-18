@@ -224,6 +224,7 @@ type harness struct {
 	ttl     *fakeTTL
 	diag    *fakeDiag
 	logs    *fakeLogs
+	health  *fakeHealth
 	dir     string
 	outDir  string
 	stateIn string
@@ -267,14 +268,16 @@ func newHarness(t *testing.T) *harness {
 		{Seq: 2, At: time.Now(), Level: logx.LevelWarn, LevelID: "warn", Code: "ttl.apply", Message: "TTL change requested"},
 		{Seq: 3, At: time.Now(), Level: logx.LevelError, LevelID: "error", Code: "ttl.apply", Message: "write failed", Detail: "access denied"},
 	}}
+	hl := newFakeHealth()
 	s, err := New(Config{
 		Version: "test-version", Listen: "127.0.0.1:0", Interval: time.Hour,
 		OutputDir: filepath.Join(dir, "outputs"), StateDir: filepath.Join(dir, "state"), SettingsDir: filepath.Join(dir, "cfg"),
-	}, Deps{Snapshot: snap, TTL: ttl, Diag: dl, Logs: lg})
+		Health: HealthConfig{Enabled: true, Interval: 30 * time.Second, Endpoint: "203.0.113.9:443", Timeout: time.Second, Window: 4},
+	}, Deps{Snapshot: snap, TTL: ttl, Diag: dl, Logs: lg, Health: hl})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	h := &harness{t: t, srv: s, token: s.Token(), snap: snap, ttl: ttl, diag: dl, logs: lg, dir: dir}
+	h := &harness{t: t, srv: s, token: s.Token(), snap: snap, ttl: ttl, diag: dl, logs: lg, health: hl, dir: dir}
 	h.outDir = filepath.Join(dir, "outputs")
 	h.stateIn = filepath.Join(dir, "state")
 	s.refresh(context.Background()) // one snapshot so the state endpoint has data

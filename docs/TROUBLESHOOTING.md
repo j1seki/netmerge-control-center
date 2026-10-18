@@ -69,6 +69,30 @@ is bounded by the checks' own timeouts; the slowest checks are the traceroute an
 can cancel from the page; a cancelled run keeps whatever it had already established and shows the
 partial result rather than pretending it completed.
 
+### Connections says a link is "not answering" (or "not tested")
+
+First, which one it says - they mean different things:
+
+- **"not answering"** - the probe opened a connection from that adapter to the test endpoint and
+  nothing came back within the timeout. Check, in this order: the adapter has a default gateway
+  and an address (both are shown in the same card); the tether's phone screen is not asleep
+  (some phones stop USB tethering data when they idle); the cable is seated; DNS is irrelevant
+  here, because the default endpoint is an address. If a browser works but this fails, the
+  network in front of you may be dropping the endpoint - change the diagnostics endpoint in
+  Settings to something you trust.
+- **"not tested"** - nothing was probed, and that is not a claim of failure. Either the adapter
+  is not a traffic candidate (excluded, disconnected - the card gives the reason), the probe is
+  switched off (`dashboard.healthIntervalMs` is negative), or no round has run yet.
+- **No loss percentage** - loss is only shown once at least two attempts are in the window: one
+  sample is not a rate.
+
+The probe is a single TCP connection, once per adapter per round. It answers "can this adapter
+reach the internet at all, and how steadily", not "is the bonding engine using it, and how
+fast". The engine's own per-adapter state (shown in Overview/status, `State`/`State6`) stays
+authoritative for what carries traffic; when the two disagree, the engine is deciding where
+traffic goes and the probe is reporting what that adapter can still do. A change here is also an
+event (`link.reachability`) in the Logs section, with the adapter and the reason.
+
 ## The bonding engine
 
 ### The engine is "on" but only one adapter carries traffic

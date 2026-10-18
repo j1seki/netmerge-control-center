@@ -24,6 +24,7 @@ func cmdTray(args []string) {
 	startOff := fs.Bool("off", false, "start with system-wide mode OFF (default: ON)")
 	autoPause := fs.Bool("auto-pause", true, "pause by itself when fewer than two connections work, and resume when two do (pausing by hand always wins)")
 	fs.Parse(args)
+	c.resolveProfile(fs)
 
 	if !platform.IsAdmin() {
 		child := append([]string{"tray"}, args...)

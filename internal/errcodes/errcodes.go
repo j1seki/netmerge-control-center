@@ -312,6 +312,9 @@ func init() {
 	add(KindEvent, "engine_uses",
 		"the engine's own status file says which adapters it is using",
 		"")
+	add(KindEvent, "link.reachability",
+		"an adapter's reachability changed: the dashboard's probe to the test endpoint started failing, started answering again, or the adapter went away",
+		"the event names the adapter and what the probe saw; the Connections section shows the same state with loss and jitter, and Troubleshooting maps a persistently unreachable link to what to check")
 
 	// --- ports / instance -----------------------------------------------------------------------
 

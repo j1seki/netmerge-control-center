@@ -27,18 +27,36 @@ var (
 	virtualDesc = regexp.MustCompile(`(?i)virtual|vpn|\btap\b|tap-|tunnel|wintun|wireguard|tailscale|zerotier|openvpn|anyconnect|fortinet|vmware|npcap|miniport|teredo|isatap|6to4|pseudo`)
 )
 
-func DiscoverNics(include []string, weights map[string]float64) ([]Nic, error) {
-	nics, _, err := DiscoverNicsDetailed(include, weights)
+func DiscoverNics(include, exclude []string, weights map[string]float64) ([]Nic, error) {
+	nics, _, err := DiscoverNicsDetailed(include, exclude, weights)
 	return nics, err
 }
 
-func DiscoverNicsDetailed(include []string, weights map[string]float64) ([]Nic, []Skip, error) {
+// selectName is the whole explicit-list decision for one adapter name, extracted so it is
+// testable without a live interface table. Exclusion wins over inclusion: naming an adapter in
+// both lists means "never use it", which is the reading that cannot surprise anyone.
+//
+// The empty reason on an include miss is deliberate: an adapter that simply is not on the
+// include list was never a candidate, and `net-merge list` should not list every adapter on the
+// machine as "skipped".
+func selectName(include, exclude []string, name string) (ok bool, reason string) {
+	if containsFold(exclude, name) {
+		return false, "excluded by the active profile or the command line"
+	}
+	if len(include) > 0 && !containsFold(include, name) {
+		return false, ""
+	}
+	return true, ""
+}
+
+func DiscoverNicsDetailed(include, exclude []string, weights map[string]float64) ([]Nic, []Skip, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, nil, err
 	}
 	// Auto mode only takes real hardware adapters that have a default gateway (can reach the
-	// internet), per family. An explicit -include list overrides all of these checks.
+	// internet), per family. An explicit -include list overrides all of these checks; an
+	// -exclude list always applies, in both modes.
 	var info map[int]adapterInfo
 	if len(include) == 0 {
 		info, _ = adapterInfos() // nil on error: fall back to name filtering only
@@ -50,12 +68,15 @@ func DiscoverNicsDetailed(include []string, weights map[string]float64) ([]Nic, 
 			continue
 		}
 		skip := func(reason string) { skipped = append(skipped, Skip{ifc.Name, reason}) }
-		ai, haveInfo := info[ifc.Index]
-		if len(include) > 0 {
-			if !containsFold(include, ifc.Name) {
-				continue
+		ok, why := selectName(include, exclude, ifc.Name)
+		if !ok {
+			if why != "" {
+				skip(why)
 			}
-		} else {
+			continue
+		}
+		ai, haveInfo := info[ifc.Index]
+		if len(include) == 0 {
 			switch {
 			case virtualName.MatchString(ifc.Name):
 				skip("looks like a virtual/VPN adapter (name)")

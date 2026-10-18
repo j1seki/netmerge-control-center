@@ -99,7 +99,9 @@ It has no listening port on your network, no external fetch path, and no upload 
    rate yet" is not zero.
 2. **Connections** - every adapter with its state and, when excluded, the specific reason.
    Assigned connections come from the engine's own status file, so a dash means "the engine is
-   not running", never "zero".
+   not running", never "zero". A reachability probe (below) adds the live part: whether each
+   usable adapter actually reaches the internet right now, how steadily, and when its state last
+   changed.
 3. **Routing and profile** - default routes and their metrics, the leftover-route check, and the
    active quality profile. The profile is edited in Settings: changing it saves the choice and
    reports what the engine will get; the running engine is not restarted behind your back.
@@ -108,9 +110,9 @@ It has no listening port on your network, no external fetch path, and no upload 
    probes, DNS, MTU, counters and net-merge-specific correlation. Runs are background jobs.
 6. **Logs** - the structured event log (level, code, message, detail) with search and an
    incremental cursor. Codes carry their explanation from the shared registry.
-7. **Settings** - the settings file, editable with validation, plus the diagnostics endpoints
-   and privacy-redaction preferences. A file written by a different build is flagged as stale
-   rather than silently rewritten.
+7. **Settings** - the settings file, editable with validation, plus the diagnostics endpoints,
+   the reachability probe's interval, and privacy-redaction preferences. A file written by a
+   different build is flagged as stale rather than silently rewritten.
 
 Long operations (diagnostics runs, exports) are background jobs: they return immediately, report
 progress, can be cancelled, and are bounded in number. A cancelled diagnostics run keeps what it
@@ -122,16 +124,57 @@ On/off writes the same marker files the tray writes, and the status shown comes 
 own status file. There is deliberately no second control path. If the status file is older than
 three seconds it is reported as not running - a stale file is never read as "on".
 
+### The reachability probe
+
+The dashboard opens **one TCP connection per usable adapter per round** (default every 30
+seconds) to the diagnostics endpoint (default `1.1.1.1:443`), bound to that adapter, and closes
+it without sending a payload. From those attempts it reports, per adapter: reachable or not, the
+round-trip time of the last attempt, loss over the recent window, jitter between consecutive
+answers, and when the state last changed. A change is also written to the event log with its
+reason (`link.reachability`).
+
+What it establishes, and what it does not:
+
+- **It establishes** that a packet left through that specific adapter and came back from that
+  endpoint just now. That is exactly what "this link works" means for a phone tether or a
+  plugged cable.
+- **It does not establish** bandwidth, which route the operating system picked, or whether the
+  bonding engine is using the adapter. It is a single connection, not a throughput test, and it
+  is not a second engine: the engine's own per-adapter probing stays authoritative when the
+  engine runs, and it is the engine that decides which links carry traffic.
+- **A refusal is an answer.** If the endpoint refuses the connection - which a captive portal or
+  a filtering middlebox can do - the path answered and is reported reachable, with the refusal
+  spelled out, rather than being mislabelled unreachable.
+- **"Not tested" is said out loud.** An adapter that is excluded, disconnected or not a traffic
+  candidate is not probed, and reads "not tested" - which is not the same as "broken" or "fine".
+  With no samples yet, or with one sample, no loss percentage is shown: one sample is not a rate.
+
+The probe can be slowed or turned off in Settings (`dashboard.healthIntervalMs`: milliseconds
+between rounds, `0` for the default, `-1` to disable). When it is off the page says so instead of
+showing an empty table.
+
 ## Quality profiles
 
-Profiles set the engine's include/exclude lists, weights and auto-weighting. They do not change
-anything by themselves: switching a profile saves it and reports what the engine will get; the
-running engine is not restarted behind your back.
+Profiles set the engine's include/exclude lists, weights and auto-weighting. A profile is
+**effective at the next engine start**, not retroactively:
+
+- Starting the engine from the tray or with `net-merge run` fills in only the flags you did not
+  give on that command line. An explicit flag always wins, field by field: `net-merge run -mtu
+  1280` with a profile that asks for 1400 uses 1280 and still takes the profile's exclusions.
+- Adapter selection is treated as one question. If you name adapters yourself (`-include` or
+  `-exclude`), that is your complete answer and the profile's adapter lists do not apply; the
+  profile's other settings still do.
+- `-no-profile` ignores the profile entirely for one command, and `net-merge list` shows which
+  profile is active and what it would do (`net-merge list -no-profile` shows the difference).
+- The startup log names exactly the settings a profile supplied, so a surprising engine argument
+  is traceable to the profile that supplied it.
+- Switching a profile in the dashboard saves the choice and reports what the engine will get.
+  The running engine is not restarted behind your back, and nothing is written to the system.
 
 | Profile | What it does |
 |---|---|
 | Maximum Throughput | Uses every eligible path and lets the engine weight adapters by measured throughput. Balancing is per connection: separate connections spread across links, one TCP connection still uses one link. |
-| Gaming / Low Latency | Favours the healthy lower-latency path for interactive traffic. Established connections are not broken; pin the weight to the link you want preferred. |
+| Gaming / Low Latency | Turns auto-weighting off, so new flows are not steered by measured throughput onto a link that may be faster but slower to answer, and fixed weights you set are kept. The engine still keeps new flows off links whose own probes are failing. |
 | Fiber Preferred | Prefers the wired home fiber for ordinary traffic; other adapters stay excluded unless included. |
 | Connection Reliability | Watches link health and reports transitions. The engine already removes an adapter from new assignments when its probes fail and restores it after recovery; auto-weighting lets a degraded link contribute less. |
 | Custom | Your own include list, exclusions and weights - nothing is assumed. |

@@ -258,7 +258,7 @@ func TestEngineArgsAreRealEngineFlags(t *testing.T) {
 		Engine: EnginePrefs{
 			Include:    []string{"Ethernet", "Wi-Fi"},
 			Weights:    map[string]float64{"Wi-Fi": 2, "Ethernet": 1.5},
-			AutoWeight: false,
+			AutoWeight: Bool(false),
 			IPv6:       "off",
 			MTU:        1400,
 		},
@@ -281,12 +281,15 @@ func TestEngineArgsAreRealEngineFlags(t *testing.T) {
 		t.Errorf("weights must be sorted by name: %s", args)
 	}
 
-	// The engine has no -exclude; an exclusion-only profile says what it cannot express, rather
-	// than inventing a flag.
-	ex := Profile{Engine: EnginePrefs{Exclude: []string{"Wi-Fi"}, AutoWeight: true, IPv6: "auto"}}
+	// An exclusion-only profile renders the engine's real -exclude flag: the Control Center
+	// does not translate it into an include list, so an adapter plugged in later still joins.
+	ex := Profile{Engine: EnginePrefs{Exclude: []string{"Wi-Fi"}, AutoWeight: Bool(true), IPv6: "auto"}}
 	exArgs := strings.Join(ex.EngineArgs(), " ")
-	if !strings.Contains(exArgs, "-include <all except: Wi-Fi>") {
-		t.Errorf("exclusion should be surfaced honestly: %s", exArgs)
+	if !strings.Contains(exArgs, "-exclude Wi-Fi") {
+		t.Errorf("exclusion should render as -exclude: %s", exArgs)
+	}
+	if strings.Contains(exArgs, "-include") {
+		t.Errorf("an exclusion-only profile must not invent an include list: %s", exArgs)
 	}
 	if strings.Contains(exArgs, "-auto-weight=false") {
 		t.Errorf("auto-weight is on, so no override flag should appear: %s", exArgs)
@@ -296,9 +299,37 @@ func TestEngineArgsAreRealEngineFlags(t *testing.T) {
 	}
 }
 
+// TestOverlayCarriesNoOpinionWhenUnset pins the tri-state behaviour: a profile that says
+// nothing about auto-weighting or IPv6 leaves the engine's own default alone, and a profile
+// that says false means false. A plain bool made those two indistinguishable.
+func TestOverlayCarriesNoOpinionWhenUnset(t *testing.T) {
+	custom := Default().Profiles[ProfileCustom]
+	ov := custom.Overlay()
+	if ov.AutoWeight != nil {
+		t.Errorf("custom profile has an opinion on auto-weight (%v); it must leave the engine default alone", *ov.AutoWeight)
+	}
+	gaming := Default().Profiles[ProfileGaming]
+	if ov := gaming.Overlay(); ov.AutoWeight == nil || *ov.AutoWeight {
+		t.Errorf("gaming profile auto-weight = %v, want an explicit false", ov.AutoWeight)
+	}
+
+	// The overlay is a copy: mutating it cannot reach stored settings.
+	src := Profile{Engine: EnginePrefs{
+		Include: []string{"Ethernet"}, Exclude: []string{"Wi-Fi"},
+		Weights: map[string]float64{"Ethernet": 2},
+	}}
+	ov = src.Overlay()
+	ov.Include[0] = "MUTATED"
+	ov.Exclude[0] = "MUTATED"
+	ov.Weights["Ethernet"] = 99
+	if src.Engine.Include[0] != "Ethernet" || src.Engine.Exclude[0] != "Wi-Fi" || src.Engine.Weights["Ethernet"] != 2 {
+		t.Errorf("Overlay aliased the stored settings: %+v", src.Engine)
+	}
+}
+
 func TestBuiltinProfilesRenderWithoutInventedFlags(t *testing.T) {
 	cfg := Default()
-	known := map[string]bool{"-include": true, "-auto-weight": true, "-weight": true, "-ipv6": true, "-mtu": true}
+	known := map[string]bool{"-include": true, "-exclude": true, "-auto-weight": true, "-weight": true, "-ipv6": true, "-mtu": true}
 	for _, p := range cfg.SortedProfiles() {
 		args := p.EngineArgs()
 		for i := 0; i < len(args); i += 2 {

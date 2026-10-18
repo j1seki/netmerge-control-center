@@ -27,6 +27,7 @@ import (
 	"net-merge/internal/errcodes"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
+	"net-merge/internal/monitor"
 	"net-merge/internal/platform"
 	"net-merge/internal/state"
 	"net-merge/internal/ttlmgr"
@@ -53,8 +54,39 @@ type stateView struct {
 	Snapshot      *inventory.Snapshot `json:"snapshot,omitempty"`
 	Engine        *engineStatus       `json:"engine,omitempty"`
 	EngineOn      bool                `json:"engineOn"`
+	Monitor       *monitorView        `json:"monitor,omitempty"`
 	Settings      *appcfg.Config      `json:"settings,omitempty"`
 	SettingsError string              `json:"settingsError,omitempty"`
+}
+
+// monitorView is the link-health probe's state for the page. Enabled false is a fact the page
+// states out loud ("the reachability probe is off") rather than leaving a table that looks
+// like every link is unknown.
+type monitorView struct {
+	Enabled     bool                 `json:"enabled"`
+	IntervalMs  int64                `json:"intervalMs,omitempty"`
+	Endpoint    string               `json:"endpoint,omitempty"`
+	Links       []monitor.LinkView   `json:"links,omitempty"`
+	Transitions []monitor.Transition `json:"transitions,omitempty"`
+}
+
+// healthView builds the monitor section. It returns nil when no monitor is attached at all,
+// so the field is absent rather than claiming to be off.
+func (s *Server) healthView() *monitorView {
+	if s.deps.Health == nil {
+		return nil
+	}
+	v := &monitorView{
+		Enabled:    s.cfg.Health.Enabled,
+		IntervalMs: s.cfg.Health.Interval.Milliseconds(),
+		Endpoint:   s.cfg.Health.Endpoint,
+	}
+	if !s.cfg.Health.Enabled {
+		return v
+	}
+	v.Links = s.deps.Health.View()
+	v.Transitions = s.deps.Health.Transitions(20)
+	return v
 }
 
 func (s *Server) buildState() stateView {
@@ -65,6 +97,7 @@ func (s *Server) buildState() stateView {
 		CollectError: snapErr,
 		CollectedAt:  at,
 		Snapshot:     snap,
+		Monitor:      s.healthView(),
 		App: appView{
 			Version:      s.cfg.Version,
 			Platform:     runtime.GOOS,
@@ -101,24 +134,61 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 // --- engine -----------------------------------------------------------------------------------
 
-// engineStatus is the dashboard's own view of the engine's status file. It exists because the
-// file itself has no JSON tags: that file is a shared contract with the engine binary, so its
-// wire format stays exactly as the engine writes it, and the lowercase API shape is produced
-// here instead of by editing the shared struct.
+// engineNIC is one line of the engine's per-adapter table, in the API's lowercase shape.
+// engine.SlotStats carries no JSON tags on purpose - it is embedded in the engine's own status
+// file, whose wire format is a contract with the engine binary - so the projection is built
+// here. Without it the API served PascalCase field names that the page could not read.
+type engineNIC struct {
+	Name     string  `json:"name"`
+	IP       string  `json:"ip,omitempty"`
+	IP6      string  `json:"ip6,omitempty"`
+	State    string  `json:"state,omitempty"`  // IPv4 probe state; "-" when the adapter has no IPv4
+	State6   string  `json:"state6,omitempty"` // IPv6 probe state
+	Weight   float64 `json:"weight"`
+	Weight6  float64 `json:"weight6"`
+	Present  bool    `json:"present"`
+	Active   int64   `json:"active"`
+	Total    int64   `json:"total"`
+	Failed   int64   `json:"failed"`
+	BytesIn  int64   `json:"bytesIn"`
+	BytesOut int64   `json:"bytesOut"`
+	RateIn   float64 `json:"rateIn"`
+	RateOut  float64 `json:"rateOut"`
+	LinkIn   float64 `json:"linkIn"`
+	LinkOut  float64 `json:"linkOut"`
+	Peak     float64 `json:"peak"`
+	Peak6    float64 `json:"peak6"`
+}
+
+func viewSlotStats(s engine.SlotStats) engineNIC {
+	return engineNIC{
+		Name: s.Name, IP: s.IP, IP6: s.IP6, State: s.State, State6: s.State6,
+		Weight: s.Weight, Weight6: s.Weight6, Present: s.Present,
+		Active: s.Active, Total: s.Total, Failed: s.Failed,
+		BytesIn: s.BytesIn, BytesOut: s.BytesOut,
+		RateIn: s.RateIn, RateOut: s.RateOut, LinkIn: s.LinkIn, LinkOut: s.LinkOut,
+		Peak: s.Peak, Peak6: s.Peak6,
+	}
+}
+
 type engineStatus struct {
-	PID     int                `json:"pid"`
-	Mode    string             `json:"mode"`
-	V6      string             `json:"v6"`
-	Since   time.Time          `json:"since"`
-	Updated time.Time          `json:"updated"`
-	NICs    []engine.SlotStats `json:"nics,omitempty"`
+	PID     int         `json:"pid"`
+	Mode    string      `json:"mode"`
+	V6      string      `json:"v6"`
+	Since   time.Time   `json:"since"`
+	Updated time.Time   `json:"updated"`
+	NICs    []engineNIC `json:"nics,omitempty"`
 }
 
 func viewEngineStatus(st *state.Status) *engineStatus {
 	if st == nil {
 		return nil
 	}
-	return &engineStatus{PID: st.PID, Mode: st.Mode, V6: st.V6, Since: st.Since, Updated: st.Updated, NICs: st.NICs}
+	v := &engineStatus{PID: st.PID, Mode: st.Mode, V6: st.V6, Since: st.Since, Updated: st.Updated}
+	for _, n := range st.NICs {
+		v.NICs = append(v.NICs, viewSlotStats(n))
+	}
+	return v
 }
 
 type engineView struct {

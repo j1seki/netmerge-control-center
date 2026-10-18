@@ -344,10 +344,54 @@ function renderConnections() {
   const body = $("#connBody");
   const snap = state && state.snapshot;
   const count = $("#connCount");
+  const mon = state && state.monitor;
   clear(body);
   if (!snap) { clear(count); count.textContent = "No snapshot yet."; body.append(h("div", { class: "notice info" }, "Waiting for the first adapter read.")); return; }
   count.textContent = snap.adapters.length + " adapters · snapshot from " + stamp(snap.taken) + " · source " + (snap.source || UNKNOWN);
+  if (mon) {
+    count.textContent += mon.enabled
+      ? " · reachability probe to " + (mon.endpoint || UNKNOWN) + " every " + dur(mon.intervalMs)
+      : " · reachability probe off";
+  }
+  if (mon && !mon.enabled) {
+    body.append(h("div", { class: "notice info" },
+      "The reachability probe is off (dashboard.healthIntervalMs is negative in settings). ",
+      h("strong", null, "“not tested” below means exactly that"), " — nothing here is a claim that a link does or does not work."));
+  }
   snap.adapters.forEach((a) => body.append(adapterCard(a)));
+}
+
+// monitorLink finds the reachability monitor's view of one adapter, which carries the state
+// the per-adapter health snapshot does not: since when, and how many changes it has seen.
+function monitorLink(name) {
+  const links = (state && state.monitor && state.monitor.links) || [];
+  for (let i = 0; i < links.length; i++) if (links[i].name === name) return links[i];
+  return null;
+}
+
+// healthText renders one adapter's reachability. Every part that is unknown is said to be
+// unknown; an untested adapter never renders as a healthy one.
+function healthText(a) {
+  const link = monitorLink(a.name);
+  const parts = [];
+  if (link) {
+    parts.push(link.state === "reachable" ? "reachable"
+      : link.state === "unreachable" ? "not answering"
+      : link.state === "absent" ? "gone from the last check"
+      : "not checked yet");
+  } else if (a.health) {
+    parts.push(a.health.ok ? "reachable" : "did not answer");
+  }
+  if (a.health) {
+    if (a.health.rttMs) parts.push(a.health.rttMs.toFixed(1) + " ms");
+    if (a.health.lossPct) parts.push("loss " + a.health.lossPct.toFixed(0) + "% in the recent window");
+    if (a.health.jitterMs) parts.push("jitter " + a.health.jitterMs.toFixed(1) + " ms");
+    if (a.health.endpoint) parts.push("via " + a.health.endpoint);
+    if (a.health.detail) parts.push(a.health.detail);
+    if (a.health.at) parts.push("at " + stamp(a.health.at));
+  }
+  if (link && link.changes) parts.push("state changed " + link.changes + "× — last " + stamp(link.since));
+  return parts.length ? parts.join(" · ") : "— not tested";
 }
 
 function adapterCard(a) {
@@ -384,7 +428,7 @@ function adapterCard(a) {
     ["Routes", (a.routeCount || (a.routes || []).length) + " in the table" + (a.defaultRoutes && a.defaultRoutes.length ? " · " + a.defaultRoutes.length + " default" : "")],
     ["Counters", a.counters ? ("received " + bytes(a.counters.in) + " · sent " + bytes(a.counters.out)) : "— not available on this platform"],
     ["Rates", a.rates ? (rate(a.rates.inPerSec) + " ↓ / " + rate(a.rates.outPerSec) + " ↑ over " + (a.rates.spanSeconds ? a.rates.spanSeconds.toFixed(1) + "s" : "one interval")) : "— no rate yet (this is not zero: it means the counters have not been observed twice)"],
-    ["Health probe", a.health ? (a.health.ok ? "reachable" : "did not answer") + (a.health.at ? " at " + stamp(a.health.at) : "") + (a.health.endpoint ? " via " + a.health.endpoint : "") : "— not tested"],
+    ["Health probe", healthText(a)],
     ["Engine use", a.engine ? "yes" : "no" + (a.exclusionCode ? " (excluded)" : "")],
     ["Connections assigned by engine", a.engineAssigned === null || a.engineAssigned === undefined ? "— the engine does not report this" : String(a.engineAssigned)],
   ];

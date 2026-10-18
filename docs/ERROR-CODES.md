@@ -67,6 +67,7 @@ anything that reads them.
 | `engine_stale_adapter` | error | a route names an interface that no longer exists, usually left behind by a phone or adapter removed while the engine was running | run net-merge cleanup to remove the engine's own leftover routes; operating-system routes clear by themselves when the adapter returns or after a restart |
 | `engine_start` | event | the engine was asked to start | — |
 | `engine_uses` | event | the engine's own status file says which adapters it is using | — |
+| `link.reachability` | event | an adapter's reachability changed: the dashboard's probe to the test endpoint started failing, started answering again, or the adapter went away | the event names the adapter and what the probe saw; the Connections section shows the same state with loss and jitter, and Troubleshooting maps a persistently unreachable link to what to check |
 | `port_in_use` | error | the port the proxy needs is already taken by another process | the check names the holder when the platform allows it; close that program or configure a different port |
 | `ttl_already_at_value` | error | the requested value is already in place | nothing to do; this is reported as a change that was not needed rather than as a failure |
 | `ttl_busy` | safety | another change is in progress, or a previous run left its lock behind | wait for it to finish. A stale lock from a crashed process is reclaimed automatically; the details say whether that happened |
@@ -87,4 +88,4 @@ anything that reads them.
 | `ttl_write_failed` | error | the platform rejected the write | the details carry the platform's own error. The original value is unchanged unless the detail says otherwise |
 | `tun_driver_missing` | error | the virtual network driver the bonding engine needs is not present or not loadable | on Windows, run the repository's scripts/fetch-wintun.ps1 once to place the driver, then start the engine again; the driver is required only by the engine, not by the dashboard |
 
-Registry size: 75 code(s).
+Registry size: 76 code(s).

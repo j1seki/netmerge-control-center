@@ -43,6 +43,7 @@ import (
 	"net-merge/internal/errcodes"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
+	"net-merge/internal/monitor"
 	"net-merge/internal/state"
 	"net-merge/internal/ttlmgr"
 )
@@ -64,6 +65,10 @@ const (
 
 	// defaultInterval is how often the monitor refreshes the cached snapshot.
 	defaultInterval = 2 * time.Second
+	// defaultHealthInterval is how often link reachability is probed when the settings file
+	// does not say. It is much slower than the snapshot loop on purpose: each round opens one
+	// TCP connection per adapter, so the snapshot loop must never carry it.
+	defaultHealthInterval = 30 * time.Second
 	// defaultMaxJobs bounds retained background jobs; the oldest finished one is dropped.
 	defaultMaxJobs = 24
 )
@@ -97,6 +102,15 @@ type LogsReader interface {
 	Search(f logx.Filter, limit int) []logx.Event
 }
 
+// HealthChecker is the reachability monitor as the dashboard uses it. It is an interface so the
+// HTTP layer is tested without a network, and the monitor itself has no idea a dashboard exists.
+type HealthChecker interface {
+	Check(ctx context.Context, targets []monitor.Target) monitor.Round
+	Health() map[string]inventory.Health
+	View() []monitor.LinkView
+	Transitions(limit int) []monitor.Transition
+}
+
 // Deps are the collaborators. Snapshot is required; the rest may be nil, and the endpoints that
 // need a missing one say so rather than serving an empty view that looks like real state.
 type Deps struct {
@@ -104,9 +118,21 @@ type Deps struct {
 	TTL      TTLManager
 	Diag     DiagRunner
 	Logs     LogsReader
+	Health   HealthChecker
 
 	// Now is injectable for tests. Defaults to time.Now.
 	Now func() time.Time
+}
+
+// HealthConfig is the link-health probe's schedule, assembled from the application settings.
+// Enabled false means the user turned the probe off; the page then says so instead of showing
+// an empty table that looks like "nothing is known".
+type HealthConfig struct {
+	Enabled  bool
+	Interval time.Duration
+	Endpoint string
+	Timeout  time.Duration
+	Window   int
 }
 
 // Config is the dashboard's own settings, assembled by the command from the application
@@ -119,6 +145,7 @@ type Config struct {
 	StateDir    string
 	SettingsDir string
 	MaxJobs     int
+	Health      HealthConfig
 }
 
 // Server is the running dashboard.
@@ -176,6 +203,9 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	}
 	if cfg.StateDir == "" {
 		cfg.StateDir = state.DefaultDir()
+	}
+	if cfg.Health.Interval <= 0 {
+		cfg.Health.Interval = defaultHealthInterval
 	}
 	now := deps.Now
 	if now == nil {
@@ -238,6 +268,9 @@ func (s *Server) Start() (string, error) {
 		}
 	}()
 	go s.monitor()
+	if s.cfg.Health.Enabled && s.deps.Health != nil {
+		go s.healthLoop()
+	}
 	logx.Eventf(logx.LevelInfo, "dashboard.start", "dashboard listening on %s", s.addr)
 	return s.addr, nil
 }
@@ -292,6 +325,131 @@ func (s *Server) refresh(ctx context.Context) {
 	s.snap = snap
 	s.snapErr = ""
 	s.snapFails = 0
+	s.applyHealthLocked()
+}
+
+// healthLoop probes link reachability on its own, slower schedule until Close. It is a separate
+// loop because this is the most expensive thing the dashboard does and the snapshot loop must
+// stay cheap: the page always has data, even while a probe is in flight.
+func (s *Server) healthLoop() {
+	t := time.NewTicker(s.cfg.Health.Interval)
+	defer t.Stop()
+	s.healthOnce(s.baseCtx)
+	for {
+		select {
+		case <-s.baseCtx.Done():
+			return
+		case <-t.C:
+			s.healthOnce(s.baseCtx)
+		}
+	}
+}
+
+// healthOnce runs one round of checks and folds the results in. It returns how many adapters
+// were actually tested, so a caller (or a test) can tell "all reachable" from "nothing probed".
+func (s *Server) healthOnce(ctx context.Context) int {
+	if s.deps.Health == nil || !s.cfg.Health.Enabled {
+		return 0
+	}
+	targets := healthTargets(s.cachedSnap())
+	if len(targets) == 0 {
+		return 0
+	}
+	round := s.deps.Health.Check(ctx, targets)
+	s.mu.Lock()
+	s.applyHealthLocked()
+	s.mu.Unlock()
+	for _, tr := range round.Transitions {
+		s.logTransition(tr)
+	}
+	return len(round.Results)
+}
+
+// cachedSnap is the snapshot without the error state, for callers that only need the adapters.
+func (s *Server) cachedSnap() *inventory.Snapshot {
+	snap, _, _ := s.cached()
+	return snap
+}
+
+// healthTargets picks the adapters worth probing: the ones that can carry traffic now. An
+// excluded, disconnected or unhealthy adapter is not probed - the collector already explained
+// why it is out, and a probe would only produce a failure that says "the cable is unplugged"
+// in a worse way. An adapter the engine uses is probed like any other: the monitor observes,
+// it does not need to be told what the engine decided.
+func healthTargets(snap *inventory.Snapshot) []monitor.Target {
+	if snap == nil {
+		return nil
+	}
+	var out []monitor.Target
+	for _, a := range snap.Adapters {
+		if a.Status != inventory.StateActive && a.Status != inventory.StateEligible {
+			continue
+		}
+		if a.Index == 0 {
+			continue
+		}
+		t := monitor.Target{Name: a.Name, Index: a.Index, IP: firstUsable(a.IPv4), IP6: firstUsable(a.IPv6)}
+		if t.IP == nil && t.IP6 == nil {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// firstUsable returns the first address that can actually reach a public endpoint: a link-local
+// address cannot, and a tentative or duplicate one must not be used.
+func firstUsable(addrs []inventory.Address) net.IP {
+	for _, a := range addrs {
+		if a.LinkLocal || a.Virtual {
+			continue
+		}
+		switch a.Status {
+		case "tentative", "duplicate", "deprecated":
+			continue
+		}
+		if ip := net.ParseIP(a.Address); ip != nil {
+			return ip
+		}
+	}
+	return nil
+}
+
+// applyHealthLocked merges the monitor's most recent result per adapter into the cached
+// snapshot. It is called both after a snapshot (so a fresh snapshot never loses the health it
+// just had) and after a probe round (so a result shows up without waiting for the next
+// snapshot). Callers hold s.mu.
+func (s *Server) applyHealthLocked() {
+	if s.deps.Health == nil || s.snap == nil {
+		return
+	}
+	health := s.deps.Health.Health()
+	for i := range s.snap.Adapters {
+		a := &s.snap.Adapters[i]
+		if h, ok := health[a.Name]; ok {
+			hh := h
+			a.Health = &hh
+		} else {
+			// No reading means no reading. Leaving a previous value would present an
+			// observation from an unknown moment as the current state.
+			a.Health = nil
+		}
+	}
+}
+
+// logTransition writes a state change to the event log. The first sighting of a reachable
+// adapter is not logged: on every dashboard start that would be one line per adapter saying
+// nothing happened. A first sighting that is a failure is logged, because that is a link that
+// never came up.
+func (s *Server) logTransition(tr monitor.Transition) {
+	switch {
+	case tr.To == monitor.StateReachable && tr.From == monitor.StateUnknown:
+		return
+	case tr.To == monitor.StateReachable:
+		logx.Eventf(logx.LevelInfo, "link.reachability", "%s is reachable again (was %s): %s", tr.Name, tr.From, tr.Reason)
+	default:
+		logx.Eventf(logx.LevelWarn, "link.reachability", "%s is %s now (was %s): %s", tr.Name, tr.To, tr.From, tr.Reason)
+	}
 }
 
 // cached returns the last snapshot and the error state around it.

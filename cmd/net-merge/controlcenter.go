@@ -34,6 +34,7 @@ import (
 	"net-merge/internal/diagreport"
 	"net-merge/internal/inventory"
 	"net-merge/internal/logx"
+	"net-merge/internal/monitor"
 	"net-merge/internal/platform"
 	"net-merge/internal/state"
 	"net-merge/internal/ttlmgr"
@@ -227,6 +228,38 @@ func cmdDashboard(args []string) {
 		iv = time.Duration(cc.cfg.Dashboard.IntervalMs) * time.Millisecond
 	}
 
+	// The reachability probe: one TCP connect per usable adapter per round, on its own slower
+	// schedule. A negative healthIntervalMs in settings turns it off entirely, and the page then
+	// says the probe is off instead of showing an empty table.
+	healthCfg := dashboard.HealthConfig{
+		Endpoint: cc.cfg.Diagnostics.Endpoint,
+		Timeout:  time.Duration(cc.cfg.Diagnostics.TimeoutMs) * time.Millisecond,
+		Window:   8,
+	}
+	var health *monitor.Monitor
+	if cc.cfg.Dashboard.HealthIntervalMs >= 0 {
+		healthCfg.Enabled = true
+		healthCfg.Interval = time.Duration(cc.cfg.Dashboard.HealthIntervalMs) * time.Millisecond
+		if healthCfg.Interval <= 0 {
+			healthCfg.Interval = 30 * time.Second
+		}
+		health = monitor.New(monitor.Config{
+			Endpoint: healthCfg.Endpoint,
+			Timeout:  healthCfg.Timeout,
+			Window:   healthCfg.Window,
+		}, monitor.Deps{})
+	}
+
+	deps := dashboard.Deps{
+		Snapshot: cc,
+		TTL:      ttlAPI{m: cc.manager, s: cc.store},
+		Diag:     cc.registry,
+		Logs:     logxReader{},
+	}
+	if health != nil {
+		deps.Health = health
+	}
+
 	srv, err := dashboard.New(dashboard.Config{
 		Version:     version,
 		Listen:      addr,
@@ -234,12 +267,8 @@ func cmdDashboard(args []string) {
 		OutputDir:   "outputs",
 		StateDir:    cc.stateDir,
 		SettingsDir: cc.settingsDir,
-	}, dashboard.Deps{
-		Snapshot: cc,
-		TTL:      ttlAPI{m: cc.manager, s: cc.store},
-		Diag:     cc.registry,
-		Logs:     logxReader{},
-	})
+		Health:      healthCfg,
+	}, deps)
 	if err != nil {
 		die(err)
 	}

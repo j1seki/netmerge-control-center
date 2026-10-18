@@ -6,11 +6,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"net-merge/internal/appcfg"
 	"net-merge/internal/engine"
 	"net-merge/internal/icon"
 	"net-merge/internal/logx"
@@ -39,7 +41,9 @@ Control Center (see docs/CONTROL-CENTER.md):
   net-merge diag       run the diagnostics on the command line (-json, -export DIR)
   net-merge ttl        the IPv4 TTL / IPv6 hop-limit manager (inspect, preview, apply, restore, history)
 
-Flags for run/socks: -include "WiFi,Ethernet 3"  -weight "Name=3"  -auto-weight=false  -stats 5s
+Flags for run/socks: -include "WiFi,Ethernet 3"  -exclude "WiFi"  -weight "Name=3"  -auto-weight=false  -stats 5s
+The active quality profile (chosen in the Control Center) supplies any of these you do not set;
+an explicit flag always wins, and -no-profile uses the engine's own defaults.
 `
 
 type weightFlags map[string]float64
@@ -59,21 +63,28 @@ func (w weightFlags) Set(v string) error {
 }
 
 type common struct {
-	include  string
-	weights  weightFlags
-	rescan   time.Duration
-	stats    time.Duration
-	auto     bool
-	logFile  string
-	stateDir string
-	ipv6     string
-	mtu      int
-	pprof    string
+	include   string
+	exclude   string
+	weights   weightFlags
+	rescan    time.Duration
+	stats     time.Duration
+	auto      bool
+	logFile   string
+	stateDir  string
+	ipv6      string
+	mtu       int
+	pprof     string
+	noProfile bool
+
+	// profile is the quality profile whose settings were merged in by resolveProfile, or "".
+	// It is what the startup log names, so a user can see why the engine chose what it chose.
+	profile string
 }
 
 func (c *common) register(fs *flag.FlagSet) {
 	c.weights = weightFlags{}
 	fs.StringVar(&c.include, "include", "", "comma-separated adapter names to use (default: all non-virtual)")
+	fs.StringVar(&c.exclude, "exclude", "", "comma-separated adapter names to never use (applies in every mode)")
 	fs.Var(c.weights, "weight", `fixed adapter weight, repeatable: -weight "Wi-Fi=3"`)
 	fs.DurationVar(&c.rescan, "rescan", 3*time.Second, "adapter re-scan interval")
 	fs.DurationVar(&c.stats, "stats", 5*time.Second, "stats print interval (0 = off)")
@@ -83,16 +94,107 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.pprof, "pprof", "", "serve Go's profiler on this loopback address, e.g. 127.0.0.1:6060")
 	fs.StringVar(&c.logFile, "log", "", "write output to this file instead of the console")
 	fs.StringVar(&c.stateDir, "state-dir", state.DefaultDir(), "where status/off marker files live")
+	fs.BoolVar(&c.noProfile, "no-profile", false, "ignore the Control Center's active quality profile; use the engine's built-in defaults")
+}
+
+// resolveProfile fills in the engine settings the user did not set on this command line from
+// the Control Center's active quality profile. It is what makes a profile chosen in the
+// dashboard effective at the next engine start: the profile is read here, never written, and an
+// explicit flag always wins over it. -no-profile turns the mechanism off entirely.
+//
+// Adapter selection is treated as one question: if the user named adapters with -include or
+// -exclude, that is their complete answer to "which adapters", and the profile's own lists do
+// not apply. Every other setting is merged field by field, so "-include Ethernet" plus a profile
+// that pins a weight uses both.
+func (c *common) resolveProfile(fs *flag.FlagSet) {
+	if c.noProfile {
+		return
+	}
+	cfg, _, err := appcfg.Load(c.stateDir)
+	if err != nil {
+		// A settings file this build cannot read means the engine runs on its own defaults.
+		// The loader's error is not swallowed silently: the dashboard surfaces it too, and a
+		// corrupt file is quarantined there.
+		logx.Eventf(logx.LevelWarn, "engine.profile", "settings not readable, engine defaults apply: %v", err)
+		return
+	}
+	p, ok := cfg.Profiles[cfg.ActiveProfile]
+	if !ok {
+		return // a profile id with no matching profile; nothing to apply
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	ov := p.Overlay()
+
+	// Only a value the profile actually changes is recorded and logged: a profile whose
+	// setting equals the engine's own default is not news, and saying it was applied would
+	// train people to ignore the line that matters.
+	var applied []string
+	if !set["include"] && !set["exclude"] {
+		if v := strings.Join(ov.Include, ","); v != "" && v != c.include {
+			c.include = v
+			applied = append(applied, "-include "+v)
+		}
+		if v := strings.Join(ov.Exclude, ","); v != "" && v != c.exclude {
+			c.exclude = v
+			applied = append(applied, "-exclude "+v)
+		}
+	}
+	if !set["weight"] && len(ov.Weights) > 0 && !sameWeights(ov.Weights, c.weights) {
+		c.weights = weightFlags{}
+		var pairs []string
+		for name, w := range ov.Weights {
+			c.weights[name] = w
+			pairs = append(pairs, fmt.Sprintf("%s=%g", name, w))
+		}
+		sort.Strings(pairs)
+		applied = append(applied, "-weight "+strings.Join(pairs, " "))
+	}
+	if !set["auto-weight"] && ov.AutoWeight != nil && *ov.AutoWeight != c.auto {
+		c.auto = *ov.AutoWeight
+		applied = append(applied, fmt.Sprintf("-auto-weight=%v", c.auto))
+	}
+	if !set["ipv6"] && ov.IPv6 != "" && ov.IPv6 != c.ipv6 {
+		c.ipv6 = ov.IPv6
+		applied = append(applied, "-ipv6 "+c.ipv6)
+	}
+	if !set["mtu"] && ov.MTU != 0 && ov.MTU != c.mtu {
+		c.mtu = ov.MTU
+		applied = append(applied, fmt.Sprintf("-mtu %d", c.mtu))
+	}
+	c.profile = string(p.ID)
+	if len(applied) > 0 {
+		logx.Eventf(logx.LevelInfo, "engine.profile", "profile %q supplies settings not given on this command line: %s (override any of them with the flag itself; -no-profile ignores the profile)",
+			p.Name, strings.Join(applied, ", "))
+	}
+}
+
+// sameWeights reports whether two weight sets are identical, so a profile that pins exactly the
+// weights already in effect is not reported as a change.
+func sameWeights(a map[string]float64, b weightFlags) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+func splitNames(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *common) nicsDetailed() ([]nics.Nic, []nics.Skip, error) {
-	var inc []string
-	for _, s := range strings.Split(c.include, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			inc = append(inc, s)
-		}
-	}
-	return nics.DiscoverNicsDetailed(inc, c.weights)
+	return nics.DiscoverNicsDetailed(splitNames(c.include), splitNames(c.exclude), c.weights)
 }
 
 func (c *common) nics() ([]nics.Nic, error) {
@@ -287,6 +389,10 @@ func cmdList(args []string) {
 	var c common
 	c.register(fs)
 	fs.Parse(args)
+	c.resolveProfile(fs)
+	if c.profile != "" {
+		fmt.Printf("active quality profile: %s (its adapter and weight settings apply below; -no-profile ignores it)\n", c.profile)
+	}
 	nics, skipped, err := c.nicsDetailed()
 	if err != nil {
 		die(err)
@@ -308,6 +414,7 @@ func cmdSocks(args []string) {
 	c.register(fs)
 	listen := fs.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	fs.Parse(args)
+	c.resolveProfile(fs)
 	if err := c.setup(); err != nil {
 		die(err)
 	}
@@ -331,6 +438,7 @@ func cmdRun(args []string) {
 	crashAfter := fs.Duration("crash-after", 0, "test only: exit abruptly (no cleanup) after this long")
 	runFor := fs.Duration("for", 0, "turn off automatically after this long (0 = until stopped)")
 	fs.Parse(args)
+	c.resolveProfile(fs)
 
 	if !platform.IsAdmin() {
 		// Re-run elevated, handing over where to log and keep state.
