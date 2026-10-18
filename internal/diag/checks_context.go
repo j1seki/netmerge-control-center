@@ -66,6 +66,7 @@ func allChecks() []Check {
 		checkEngineStatus(),
 		checkEngineEligibility(),
 		checkEngineStale(),
+		checkTTLInspect(),
 		checkSecurityFirewall(),
 		checkSecurityAV(),
 	}
@@ -307,6 +308,7 @@ func checkAdaptersInventory() Check {
 			var unusable []string
 			for _, a := range snap.Unusable() {
 				unusable = append(unusable, fmt.Sprintf("%s: %s", a.Name, nonEmpty(a.Exclusion, string(a.Status))))
+				res.Items = append(res.Items, Item{Scope: a.Name, Code: "excluded", Detail: nonEmpty(a.Exclusion, string(a.Status))})
 			}
 			sort.Strings(unusable)
 			for _, u := range unusable {
@@ -901,13 +903,16 @@ func checkDNSResolve() Check {
 					switch {
 					case dnsErr.IsNotFound:
 						res.Established = append(res.Established, "the resolver answered that the name does not exist (NXDOMAIN), so the server was reachable and replied")
+						res.Items = append(res.Items, Item{Code: "nxdomain", Detail: name})
 						res.NextSteps = append(res.NextSteps, "Confirm the configured resolution name in Settings; a typo produces exactly this result.")
 					case dnsErr.IsTimeout:
 						res.Established = append(res.Established, "the resolver did not answer before the timeout, which points at DNS server reachability rather than the name")
 						res.ErrorCodes = append(res.ErrorCodes, "diag_dns_timeout")
+						res.Items = append(res.Items, Item{Code: "timeout", Detail: name})
 						res.NextSteps = append(res.NextSteps, "Run the DNS server responsiveness check to see whether a specific configured server answers.")
 					default:
 						res.ErrorCodes = append(res.ErrorCodes, "diag_dns_error")
+						res.Items = append(res.Items, Item{Code: "error", Detail: err.Error()})
 					}
 				}
 				return res
@@ -927,12 +932,15 @@ func checkDNSResolve() Check {
 				res.Summary = fmt.Sprintf("%s resolved, but to reserved/documentation addresses: %s", name, strings.Join(reserved, ", "))
 				res.Inconclusive = append(res.Inconclusive, "whether the answer is genuine: addresses in documentation ranges usually mean a sinkhole, a captive portal or a break-in-testing setup")
 				res.ErrorCodes = append(res.ErrorCodes, "diag_dns_reserved_answer")
+				res.Items = append(res.Items, Item{Code: "reserved_answer", Detail: strings.Join(reserved, ",")})
 			case len(public) > 0:
 				res.Status = StatusPass
 				res.Summary = fmt.Sprintf("%s resolved to %d public address(es)", name, len(public))
+				res.Items = append(res.Items, Item{Code: "resolved", Detail: strings.Join(public, ",")})
 			default:
 				res.Status = StatusPass
 				res.Summary = fmt.Sprintf("%s resolved to %d address(es)", name, len(ips))
+				res.Items = append(res.Items, Item{Code: "resolved", Detail: name})
 			}
 			return res
 		},
@@ -1015,6 +1023,7 @@ func checkDNSAtServer() Check {
 					},
 					NextSteps:  []string{"Compare with the DNS resolution check; if that succeeds, the host is using a different server than this one."},
 					ErrorCodes: []string{"diag_dns_server_unresponsive"},
+					Items:      []Item{{Scope: server, Code: "dns_unresponsive", Detail: name}},
 					Evidence:   []Evidence{ev},
 				}
 			}
@@ -1029,6 +1038,7 @@ func checkDNSAtServer() Check {
 				Inconclusive: []string{
 					"that the adapter whose DNS list contains this server carried the query",
 				},
+				Items:    []Item{{Scope: server, Code: "dns_answered", Detail: name}},
 				Evidence: []Evidence{ev},
 			}
 			return res

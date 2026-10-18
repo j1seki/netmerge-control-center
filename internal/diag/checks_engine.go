@@ -161,12 +161,15 @@ func checkEngineEligibility() Check {
 			snap, err := env.snapshot(ctx)
 			if err == nil && snap != nil {
 				for _, a := range snap.Usable() {
-					if !containsName(use, a.Name) {
-						res.Status = Worse(res.Status, StatusWarn)
-						res.Inconclusive = append(res.Inconclusive, fmt.Sprintf(
-							"%s is usable according to the inventory but is not in the engine's list; the engine may be excluding it for a reason above, or it may have been found after the engine's last re-scan",
-							a.Name))
+					if containsName(use, a.Name) {
+						res.Items = append(res.Items, Item{Scope: a.Name, Code: "engine_uses"})
+						continue
 					}
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "usable_not_listed"})
+					res.Status = Worse(res.Status, StatusWarn)
+					res.Inconclusive = append(res.Inconclusive, fmt.Sprintf(
+						"%s is usable according to the inventory but is not in the engine's list; the engine may be excluding it for a reason above, or it may have been found after the engine's last re-scan",
+						a.Name))
 				}
 			}
 			if len(res.Inconclusive) > 0 {
@@ -261,6 +264,9 @@ func checkEngineStale() Check {
 					"Run `net-merge cleanup` (elevated): it removes the routes net-merge created on that adapter. The adapter itself goes away with a reboot or when the driver is released.",
 					"Confirm nothing else is using that adapter before removing anything.")
 				res.ErrorCodes = append(res.ErrorCodes, "engine_stale_adapter")
+				for _, name := range tunAdapters {
+					res.Items = append(res.Items, Item{Scope: name, Code: "stale_adapter"})
+				}
 			case stale > 0:
 				res.Status = StatusWarn
 				res.Summary = fmt.Sprintf("%d route(s) name an interface that is no longer present", stale)
@@ -337,15 +343,18 @@ func checkCountersMovement() Check {
 				out := int64(a.Counters.Out) - int64(b.Counters.Out)
 				if in < 0 || out < 0 {
 					res.Inconclusive = append(res.Inconclusive, fmt.Sprintf("%s: the counters went backwards (adapter reset), so this window is discarded", a.Name))
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "reset"})
 					continue
 				}
 				if in == 0 && out == 0 {
 					idle++
 					res.Established = append(res.Established, fmt.Sprintf("%s: no bytes in %s", a.Name, window))
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "idle"})
 					continue
 				}
 				moved++
 				res.Established = append(res.Established, fmt.Sprintf("%s: %s in, %s out during %s", a.Name, humanBytes(uint64(in)), humanBytes(uint64(out)), window))
+				res.Items = append(res.Items, Item{Scope: a.Name, Code: "traffic", Detail: fmt.Sprintf("%d/%d", in, out)})
 			}
 			switch {
 			case moved == 0 && idle == 0:
@@ -441,9 +450,11 @@ func checkCountersIdle() Check {
 						"%s: engine reports %d assigned connection(s) and the adapter's counters did not move in %s", n.Name, n.Active, window))
 					res.Inconclusive = append(res.Inconclusive, fmt.Sprintf(
 						"%s: whether those connections are simply idle, or their traffic is not leaving through this adapter", n.Name))
+					res.Items = append(res.Items, Item{Scope: n.Name, Code: "assigned_no_traffic", Detail: fmt.Sprint(n.Active)})
 				} else {
 					res.Established = append(res.Established, fmt.Sprintf(
 						"%s: engine reports %d assigned connection(s) and the adapter moved %s in %s", n.Name, n.Active, humanBytes(uint64(delta)), window))
+					res.Items = append(res.Items, Item{Scope: n.Name, Code: "assigned_traffic", Detail: fmt.Sprint(n.Active)})
 				}
 			}
 			switch {
@@ -495,12 +506,16 @@ func checkSplitFamilies() Check {
 				switch {
 				case has4 && has6:
 					both = append(both, a.Name)
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "dual_stack"})
 				case has4:
 					only4 = append(only4, a.Name)
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "ipv4_only"})
 				case has6:
 					only6 = append(only6, a.Name)
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "ipv6_only"})
 				default:
 					neither = append(neither, a.Name)
+					res.Items = append(res.Items, Item{Scope: a.Name, Code: "no_address"})
 				}
 			}
 			if len(only4) > 0 {
@@ -560,6 +575,7 @@ func checkPortsConflict() Check {
 				res.Inconclusive = append(res.Inconclusive, "the port test itself failed: "+err.Error())
 			case free:
 				res.Established = append(res.Established, socks+" is free: no other process is listening there")
+				res.Items = append(res.Items, Item{Code: "port_free", Detail: socks})
 			default:
 				res.Established = append(res.Established, socks+" is already bound by another process")
 				res.Status = Worse(res.Status, StatusWarn)
@@ -567,6 +583,7 @@ func checkPortsConflict() Check {
 				res.NextSteps = append(res.NextSteps,
 					"'net-merge socks' would fail to start on that address; find the owner with `netstat -ano | findstr 1080` (Windows) or `ss -ltnp` (Linux), or choose another -listen address.")
 				res.ErrorCodes = append(res.ErrorCodes, "port_in_use")
+				res.Items = append(res.Items, Item{Code: "port_in_use", Detail: socks})
 			}
 			res.Evidence = append(res.Evidence, ev)
 
@@ -575,8 +592,10 @@ func checkPortsConflict() Check {
 			if running, ok := oneInstanceRunning(env); ok {
 				if running {
 					res.Established = append(res.Established, "another net-merge process is alive (its instance lock is held)")
+					res.Items = append(res.Items, Item{Code: "instance_running"})
 				} else {
 					res.Established = append(res.Established, "no other net-merge process holds the instance lock")
+					res.Items = append(res.Items, Item{Code: "instance_not_running"})
 				}
 			} else {
 				res.Inconclusive = append(res.Inconclusive, "whether another instance is running: the platform has no instance check available to this process")
@@ -651,6 +670,7 @@ func checkSecurityFirewall() Check {
 				if on {
 					enabled++
 					state = "enabled"
+					res.Items = append(res.Items, Item{Scope: name, Code: "firewall_enabled", Detail: "inbound " + nonEmpty(in, "?") + ", outbound " + nonEmpty(out, "?")})
 				}
 				res.Established = append(res.Established, fmt.Sprintf("%s profile: %s (inbound %s, outbound %s)", name, state, nonEmpty(in, "?"), nonEmpty(out, "?")))
 			}

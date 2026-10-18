@@ -161,6 +161,16 @@ type Measurement struct {
 	At      time.Time `json:"at"`
 }
 
+// Item is one machine-readable observation attached by a check. The prose fields (Established,
+// Summary) are for people; Items exist so the dashboard and the exported report's analysis can
+// reason about a run without parsing sentences. Codes are stable strings a consumer can switch
+// on, and Scope names the thing the observation is about (usually an adapter).
+type Item struct {
+	Scope  string `json:"scope,omitempty"`
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
+}
+
 // Result is one check's output.
 type Result struct {
 	ID       string   `json:"id"`
@@ -183,6 +193,8 @@ type Result struct {
 	ErrorCodes []string `json:"errorCodes,omitempty"`
 
 	Evidence []Evidence `json:"evidence,omitempty"`
+	// Items are machine-readable observations (see Item).
+	Items []Item `json:"items,omitempty"`
 
 	// Measure, when set, is the numeric result a UI can chart or compare across runs.
 	Measure *Measurement `json:"measure,omitempty"`
@@ -239,6 +251,12 @@ type Env struct {
 	// exposes a cheap way to ask. Nil means "no answer available", which the ports check
 	// reports as inconclusive rather than guessing.
 	instanceRunning func() bool
+
+	// InspectTTL, when set, reads the TTL/hop-limit manager's report. It is a function so the
+	// diagnostic package never constructs a manager itself: wiring the real one (with its
+	// platform backend and store) stays a deliberate choice of the caller, and tests can supply
+	// a simulation. Nil makes the TTL check skip rather than guess.
+	InspectTTL func(ctx context.Context, ifaces []ttlmgr.IfaceInfo) (ttlmgr.Report, error)
 
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error

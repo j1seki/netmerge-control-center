@@ -62,9 +62,11 @@ func checkGatewayReach() Check {
 					case loss >= 100:
 						bad++
 						res.Established = append(res.Established, fmt.Sprintf("gateway %s on %s did not answer ICMP", gw, a.Name))
+						res.Items = append(res.Items, Item{Scope: a.Name, Code: "gateway_silent", Detail: gw})
 					default:
 						ok++
 						res.Established = append(res.Established, fmt.Sprintf("gateway %s on %s answered (%.0f%% loss)", gw, a.Name, loss))
+						res.Items = append(res.Items, Item{Scope: a.Name, Code: "gateway_answered", Detail: gw})
 					}
 				}
 			}
@@ -167,6 +169,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 				Established:  []string{},
 				Inconclusive: []string{"connectivity: the endpoint name does not resolve on this host"},
 				ErrorCodes:   []string{"diag_endpoint_unresolved"},
+				Items:        []Item{{Code: "endpoint_unresolved", Detail: host}},
 				Evidence:     []Evidence{{Label: "resolve " + host, Started: true, Err: err.Error()}},
 			}
 		}
@@ -186,6 +189,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 					fmt.Sprintf("%s resolved to addresses without a %s family member", host, mode),
 				},
 				Inconclusive: []string{"whether " + mode + " works at all: this endpoint does not offer it"},
+				Items:        []Item{{Code: "family_absent", Detail: mode}},
 				Evidence:     []Evidence{{Label: "resolve " + host, Started: true, Note: fmt.Sprintf("%d address(es), none of family %s", len(ips), mode)}},
 			}
 			return res
@@ -225,6 +229,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 		res.Summary = fmt.Sprintf("connected to %s in %s", target, took.Truncate(time.Millisecond))
 		res.Established = append(res.Established, fmt.Sprintf("a TCP handshake to %s %s completed in %s",
 			target, viaLocal(localIP), took.Truncate(time.Millisecond)))
+		res.Items = append(res.Items, Item{Code: "connected", Detail: target})
 		res.Measure = &Measurement{Kind: "latency", Ms: float64(took.Microseconds()) / 1000, Target: target, At: env.Now()}
 		return res
 	}
@@ -236,6 +241,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 		res.Established = append(res.Established, fmt.Sprintf("no TCP response from %s %s within %s", target, viaLocal(localIP), timeout))
 		res.Inconclusive = append(res.Inconclusive, "whether the far side is down, the path is filtered, or a security product is dropping it")
 		res.ErrorCodes = append(res.ErrorCodes, "diag_tcp_timeout")
+		res.Items = append(res.Items, Item{Code: "timeout", Detail: target})
 		res.NextSteps = append(res.NextSteps,
 			"Compare with the gateway and DNS checks: a reachable gateway with a dead TCP path points at filtering rather than a missing route.",
 			"If a third-party security product is installed, check its network filter (the security check lists what is installed).")
@@ -246,6 +252,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 			"the packet reached the destination and it answered with a TCP reset, so the path works and the port is closed")
 		res.Inconclusive = append(res.Inconclusive, "whether a different port would answer: this probe tests the configured one")
 		res.ErrorCodes = append(res.ErrorCodes, "diag_tcp_refused")
+		res.Items = append(res.Items, Item{Code: "refused", Detail: target})
 	case strings.Contains(lower, "unreachable"), strings.Contains(lower, "no route"),
 		strings.Contains(lower, "network is down"), strings.Contains(lower, "host is down"):
 		res.Status = StatusFail
@@ -253,10 +260,12 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 		res.Established = append(res.Established, "the OS reported the destination as unreachable, before any packet left this machine")
 		res.Inconclusive = append(res.Inconclusive, "whether that is true after the routes settle: re-run if an adapter just changed state")
 		res.ErrorCodes = append(res.ErrorCodes, "diag_no_route")
+		res.Items = append(res.Items, Item{Code: "no_route", Detail: target})
 	default:
 		res.Status = StatusFail
 		res.Summary = fmt.Sprintf("%s: %v", target, err)
 		res.ErrorCodes = append(res.ErrorCodes, "diag_tcp_error")
+		res.Items = append(res.Items, Item{Code: "error", Detail: err.Error()})
 	}
 	return res
 }
@@ -340,6 +349,12 @@ func checkAdapterConnect() Check {
 				ip := localIPFor(a)
 				r := tcpConnectCheck(ctx, env, familyOf(ip), ip)
 				res.Evidence = append(res.Evidence, r.Evidence...)
+				// Re-scope the probe's machine-readable items to the adapter under test, so
+				// the report's analysis can attribute an outcome to one link.
+				for _, it := range r.Items {
+					it.Scope = a.Name
+					res.Items = append(res.Items, it)
+				}
 				switch r.Status {
 				case StatusPass:
 					okN++
@@ -446,16 +461,19 @@ func checkMTUPath() Check {
 				res.Status = StatusPass
 				res.Summary = fmt.Sprintf("a %d-byte payload (%d-byte IPv4 packet) reached %s unfragmented: the standard 1500 path", best-28, best, host)
 				res.Established = append(res.Established, fmt.Sprintf("the path to %s carries %d-byte IPv4 packets without fragmentation", host, best))
+				res.Items = append(res.Items, Item{Code: "mtu_standard", Detail: strconv.Itoa(best)})
 			case best > 0:
 				res.Status = StatusWarn
 				res.Summary = fmt.Sprintf("packets above about %d bytes did not reach %s unfragmented", best, host)
 				res.Established = append(res.Established, fmt.Sprintf("the largest unfragmented IPv4 packet observed toward %s was %d bytes", host, best))
+				res.Items = append(res.Items, Item{Code: "mtu_below_standard", Detail: strconv.Itoa(best)})
 				res.NextSteps = append(res.NextSteps,
 					"Compare the adapter MTU with this figure; when the path is smaller, a lower TUN MTU keeps large transfers from stalling.")
 			default:
 				res.Status = StatusWarn
 				res.Summary = "no probe size worked, or the results could not be interpreted"
 				res.Inconclusive = append(res.Inconclusive, "the path MTU: a target that blocks ICMP cannot be measured this way")
+				res.Items = append(res.Items, Item{Code: "mtu_unknown"})
 			}
 			res.Measure = nil
 			return res
@@ -603,6 +621,7 @@ func checkUDPProbe() Check {
 						"whether UDP is blocked entirely or only this server/port is filtered; many networks rate-limit NTP",
 					},
 					ErrorCodes: []string{"diag_udp_no_reply"},
+					Items:      []Item{{Code: "udp_no_reply", Detail: target}},
 					Evidence:   []Evidence{ev},
 				}
 			}
@@ -614,6 +633,7 @@ func checkUDPProbe() Check {
 					Established:  []string{"a UDP datagram came back, but its contents do not validate as NTP"},
 					Inconclusive: []string{"whether that is a non-NTP service on the port or an interception by a middlebox"},
 					ErrorCodes:   []string{"diag_udp_unexpected_reply"},
+					Items:        []Item{{Code: "udp_reply_invalid", Detail: target}},
 					Evidence:     []Evidence{ev},
 				}
 			}
@@ -624,6 +644,7 @@ func checkUDPProbe() Check {
 					fmt.Sprintf("a UDP request to %s returned a valid NTP reply (stratum %d) in %s", target, stratum, took.Truncate(time.Millisecond)),
 				},
 				Inconclusive: []string{"whether other UDP services work: this proves one destination, not the protocol"},
+				Items:        []Item{{Code: "udp_reply_valid", Detail: target}},
 				Measure:      &Measurement{Kind: "latency", Ms: float64(took.Microseconds()) / 1000, Target: target, At: env.Now()},
 				Evidence:     []Evidence{ev},
 			}
