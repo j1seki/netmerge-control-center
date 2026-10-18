@@ -331,17 +331,31 @@ func (s *Server) refresh(ctx context.Context) {
 // healthLoop probes link reachability on its own, slower schedule until Close. It is a separate
 // loop because this is the most expensive thing the dashboard does and the snapshot loop must
 // stay cheap: the page always has data, even while a probe is in flight.
+//
+// The first attempt usually lands before the first snapshot exists (both start together), in
+// which case there are no targets to probe. That round retries after a short wait rather than a
+// whole interval, so the page's first health reading does not lag the interval on every start.
 func (s *Server) healthLoop() {
-	t := time.NewTicker(s.cfg.Health.Interval)
+	shortWait := 2 * time.Second
+	if s.cfg.Health.Interval < shortWait {
+		shortWait = s.cfg.Health.Interval
+	}
+	wait := shortWait
+	t := time.NewTimer(wait)
 	defer t.Stop()
-	s.healthOnce(s.baseCtx)
 	for {
 		select {
 		case <-s.baseCtx.Done():
 			return
 		case <-t.C:
-			s.healthOnce(s.baseCtx)
 		}
+		s.healthOnce(s.baseCtx)
+		if s.cachedSnap() == nil {
+			wait = shortWait
+		} else {
+			wait = s.cfg.Health.Interval
+		}
+		t.Reset(wait)
 	}
 }
 

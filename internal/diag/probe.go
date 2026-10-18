@@ -7,6 +7,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"net-merge/internal/nics"
 )
 
 // Prober is the in-process counterpart of execx.Runner: everything a check does with sockets
@@ -16,9 +18,10 @@ import (
 // diagnosis: a refusal proves the path works and the port is closed, while a timeout proves
 // nothing about the far end at all.
 type Prober interface {
-	// TCPConnect dials addr (host:port) optionally from a specific local IP. It returns the
-	// time the handshake took.
-	TCPConnect(ctx context.Context, addr string, localIP net.IP) (time.Duration, error)
+	// TCPConnect dials addr (host:port) from one adapter when its address or interface index
+	// is given. ifIndex pins egress to that interface (the mechanism the engine itself uses);
+	// localIP additionally prefers that source address. It returns the time the handshake took.
+	TCPConnect(ctx context.Context, addr string, localIP net.IP, ifIndex int) (time.Duration, error)
 	// UDPExchange sends payload to addr and reads up to want bytes. It returns the reply and
 	// the round-trip time.
 	UDPExchange(ctx context.Context, addr string, payload []byte, want int) ([]byte, time.Duration, error)
@@ -34,8 +37,19 @@ type Prober interface {
 // SystemProber is the real implementation.
 type SystemProber struct{}
 
-func (SystemProber) TCPConnect(ctx context.Context, addr string, localIP net.IP) (time.Duration, error) {
-	d := &net.Dialer{}
+func (SystemProber) TCPConnect(ctx context.Context, addr string, localIP net.IP, ifIndex int) (time.Duration, error) {
+	// Binding the source address alone does NOT choose the egress interface: the route table
+	// still decides, so a probe "from" adapter A could leave through adapter B and fail for a
+	// reason that has nothing to do with A. Pinning the interface is what makes this probe
+	// per-adapter, and it is the same mechanism (IP_UNICAST_IF / SO_BINDTOIFINDEX) the bonding
+	// engine uses to send a socket out of one link.
+	v6 := false
+	if localIP != nil {
+		v6 = localIP.To4() == nil
+	} else if host, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) != nil {
+		v6 = net.ParseIP(host).To4() == nil
+	}
+	d := &net.Dialer{Control: nics.ForceEgress(ifIndex, v6)}
 	if localIP != nil {
 		d.LocalAddr = &net.TCPAddr{IP: localIP}
 	}

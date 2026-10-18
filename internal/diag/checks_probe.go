@@ -111,7 +111,7 @@ func checkIPv4Connect() Check {
 			},
 		},
 		run: func(ctx context.Context, env *Env) Result {
-			return tcpConnectCheck(ctx, env, "ipv4", nil)
+			return tcpConnectCheck(ctx, env, "ipv4", nil, 0)
 		},
 	}
 }
@@ -132,14 +132,15 @@ func checkIPv6Connect() Check {
 			Slow: true,
 		},
 		run: func(ctx context.Context, env *Env) Result {
-			return tcpConnectCheck(ctx, env, "ipv6", nil)
+			return tcpConnectCheck(ctx, env, "ipv6", nil, 0)
 		},
 	}
 }
 
-// tcpConnectCheck runs the family-specific connectivity check. localIP, when set, forces the
-// probe out of one adapter's address (the per-adapter case).
-func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP) Result {
+// tcpConnectCheck runs the family-specific connectivity check. localIP, when set, prefers one
+// adapter's source address; ifIndex, when set, pins egress to that adapter. The per-adapter
+// case passes both, because source binding alone does not decide the route.
+func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP, ifIndex int) Result {
 	endpoint := env.Config.Endpoint
 	if endpoint == "" {
 		return Result{Status: StatusSkipped, Summary: "no endpoint is configured for this check"}
@@ -211,13 +212,16 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	start := env.Now()
-	took, err := env.Probes.TCPConnect(cctx, target, localIP)
+	took, err := env.Probes.TCPConnect(cctx, target, localIP, ifIndex)
 	if took == 0 {
 		took = env.Now().Sub(start)
 	}
 	label := fmt.Sprintf("TCP connect to %s", target)
 	if localIP != nil {
 		label += " from " + localIP.String()
+	}
+	if ifIndex > 0 {
+		label += fmt.Sprintf(" pinned to interface %d", ifIndex)
 	}
 	ev := Evidence{Label: label, Started: true, Duration: took}
 	if resolved != "" {
@@ -228,7 +232,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 		res.Status = StatusPass
 		res.Summary = fmt.Sprintf("connected to %s in %s", target, took.Truncate(time.Millisecond))
 		res.Established = append(res.Established, fmt.Sprintf("a TCP handshake to %s %s completed in %s",
-			target, viaLocal(localIP), took.Truncate(time.Millisecond)))
+			target, viaLocal(localIP, ifIndex), took.Truncate(time.Millisecond)))
 		res.Items = append(res.Items, Item{Code: "connected", Detail: target})
 		res.Measure = &Measurement{Kind: "latency", Ms: float64(took.Microseconds()) / 1000, Target: target, At: env.Now()}
 		return res
@@ -238,7 +242,7 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 	case isTimeout(err, lower):
 		res.Status = StatusFail
 		res.Summary = fmt.Sprintf("%s did not answer within %s", target, timeout)
-		res.Established = append(res.Established, fmt.Sprintf("no TCP response from %s %s within %s", target, viaLocal(localIP), timeout))
+		res.Established = append(res.Established, fmt.Sprintf("no TCP response from %s %s within %s", target, viaLocal(localIP, ifIndex), timeout))
 		res.Inconclusive = append(res.Inconclusive, "whether the far side is down, the path is filtered, or a security product is dropping it")
 		res.ErrorCodes = append(res.ErrorCodes, "diag_tcp_timeout")
 		res.Items = append(res.Items, Item{Code: "timeout", Detail: target})
@@ -270,11 +274,16 @@ func tcpConnectCheck(ctx context.Context, env *Env, mode string, localIP net.IP)
 	return res
 }
 
-func viaLocal(ip net.IP) string {
-	if ip == nil {
-		return "(OS-selected link)"
+func viaLocal(ip net.IP, ifIndex int) string {
+	switch {
+	case ip != nil && ifIndex > 0:
+		return fmt.Sprintf("from %s on interface %d", ip, ifIndex)
+	case ip != nil:
+		return "from " + ip.String()
+	case ifIndex > 0:
+		return fmt.Sprintf("on interface %d", ifIndex)
 	}
-	return "from " + ip.String()
+	return "(OS-selected link)"
 }
 
 func isTimeout(err error, lower string) bool {
@@ -320,13 +329,14 @@ func checkAdapterConnect() Check {
 			ID:       "adapters.connect",
 			Title:    "Per-adapter connectivity",
 			Category: CatAdapters,
-			Purpose:  "Prove each eligible adapter can reach the endpoint, by binding the probe to that adapter's own address.",
+			Purpose:  "Prove each eligible adapter can reach the endpoint, by pinning the probe to that adapter's egress interface and source address.",
 			Establishes: []string{
-				"for every adapter that reports an address: whether a TCP connection to the configured endpoint succeeds when the source address is that adapter's",
+				"for every adapter that reports an address: whether a TCP connection to the configured endpoint succeeds when the probe is pinned to that adapter (egress interface and source address)",
+				"which adapter each result belongs to: the evidence names the interface the probe was pinned to",
 			},
 			DoesNotEstablish: []string{
-				"that a successful probe came out of the intended adapter on every platform: binding a source address is a best-effort method, and a multi-homed host can still route it elsewhere. A failure is a strong signal; a success is a good one",
-				"anything about a connection that is not this probe",
+				"that other applications' traffic uses the same adapter: this probe is pinned, while ordinary traffic is routed by the operating system",
+				"throughput or stability: one handshake is a reachability fact, not a speed test",
 			},
 			Slow: true,
 		},
@@ -347,7 +357,12 @@ func checkAdapterConnect() Check {
 			okN, failN := 0, 0
 			for _, a := range adapters {
 				ip := localIPFor(a)
-				r := tcpConnectCheck(ctx, env, familyOf(ip), ip)
+				idx := a.Index
+				if ip != nil && ip.To4() == nil && a.IndexV6 != 0 {
+					// Pin the v6 probe by its IPv6 interface index; the two can differ on Windows.
+					idx = a.IndexV6
+				}
+				r := tcpConnectCheck(ctx, env, familyOf(ip), ip, idx)
 				res.Evidence = append(res.Evidence, r.Evidence...)
 				// Re-scope the probe's machine-readable items to the adapter under test, so
 				// the report's analysis can attribute an outcome to one link.
@@ -375,8 +390,8 @@ func checkAdapterConnect() Check {
 				res.Summary = fmt.Sprintf("all %d eligible adapter(s) reached the endpoint", okN)
 			case okN == 0:
 				res.Status = StatusFail
-				res.Summary = "no eligible adapter could reach the endpoint by source-address binding"
-				res.Inconclusive = append(res.Inconclusive, "whether the OS ignored the source binding: treat this as a strong signal, not proof")
+				res.Summary = "no eligible adapter could reach the endpoint with the probe pinned to it"
+				res.Inconclusive = append(res.Inconclusive, "whether the interface pinning itself failed: the evidence shows each probe's error, and a pinning failure appears there as a socket-option error, not as a silent timeout")
 			default:
 				res.Status = StatusWarn
 				res.Summary = fmt.Sprintf("%d of %d adapter(s) reached the endpoint", okN, okN+failN)

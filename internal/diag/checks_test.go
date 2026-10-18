@@ -130,6 +130,20 @@ func TestAdapterConnectBindsEveryEligibleAddress(t *testing.T) {
 			t.Errorf("no probe was bound to %s (probes: %+v)", want, locals)
 		}
 	}
+	// Regression: every per-adapter probe must be pinned to a NON-ZERO interface index (the
+	// adapter's own IfIndex). Binding only the source address does not choose egress on a
+	// multi-homed host — the live fiber+wifi+tether box timed out to 1.1.1.1 until ForceEgress
+	// pinning was added, so this pins the fix.
+	wantIdx := map[string]int{"10.0.0.5": 2, "10.0.0.9": 3}
+	for _, c := range p.connects {
+		if c.IfIndex == 0 {
+			t.Errorf("probe from %s carried IfIndex=0: per-adapter probes must pin egress to the adapter's interface index", c.Local)
+			continue
+		}
+		if want, ok := wantIdx[c.Local]; ok && c.IfIndex != want {
+			t.Errorf("probe from %s pinned to IfIndex %d, want the adapter's index %d", c.Local, c.IfIndex, want)
+		}
+	}
 	if res.Status != StatusWarn {
 		t.Fatalf("status = %s, want warn (one of two links failed)", res.Status)
 	}

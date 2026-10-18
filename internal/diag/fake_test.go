@@ -9,6 +9,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +20,11 @@ import (
 // fakeRunner replays command results. It is the simulation of a Windows (or Linux) host's
 // command surface: a test registers the exact argv it expects, and anything unregistered
 // returns an empty success - which is itself a case the checks must handle gracefully.
+//
+// Registry.RunAll runs checks concurrently, so Run is called from several goroutines at once
+// and the call log needs a mutex. (Registering is done before the run, from one goroutine.)
 type fakeRunner struct {
+	mu      sync.Mutex
 	results map[string]execx.Result
 	paths   map[string]string // command name -> path; missing means "not installed"
 	calls   []string
@@ -68,8 +73,11 @@ func (f *fakeRunner) installed(name string) *fakeRunner {
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) execx.Result {
 	k := key(name, args...)
+	f.mu.Lock()
 	f.calls = append(f.calls, k)
-	if r, ok := f.results[k]; ok {
+	r, ok := f.results[k]
+	f.mu.Unlock()
+	if ok {
 		return r
 	}
 	// An unregistered command resolves, runs, and prints nothing: the shape of a real command
@@ -90,6 +98,7 @@ func (e *notFoundError) Error() string { return "executable file not found: " + 
 
 // fakeProber answers network probes from a table. Nothing here touches a socket.
 type fakeProber struct {
+	mu         sync.Mutex
 	connectFn  func(addr string, local net.IP) (time.Duration, error)
 	lookupFn   func(name string) ([]net.IP, error)
 	lookupAtFn func(name, server string) ([]net.IP, error)
@@ -102,16 +111,19 @@ type fakeProber struct {
 }
 
 type connectCall struct {
-	Addr  string
-	Local string
+	Addr    string
+	Local   string
+	IfIndex int
 }
 
-func (p *fakeProber) TCPConnect(ctx context.Context, addr string, local net.IP) (time.Duration, error) {
+func (p *fakeProber) TCPConnect(ctx context.Context, addr string, local net.IP, ifIndex int) (time.Duration, error) {
 	l := ""
 	if local != nil {
 		l = local.String()
 	}
-	p.connects = append(p.connects, connectCall{Addr: addr, Local: l})
+	p.mu.Lock()
+	p.connects = append(p.connects, connectCall{Addr: addr, Local: l, IfIndex: ifIndex})
+	p.mu.Unlock()
 	if p.connectFn != nil {
 		return p.connectFn(addr, local)
 	}
@@ -119,7 +131,9 @@ func (p *fakeProber) TCPConnect(ctx context.Context, addr string, local net.IP) 
 }
 
 func (p *fakeProber) UDPExchange(ctx context.Context, addr string, payload []byte, want int) ([]byte, time.Duration, error) {
+	p.mu.Lock()
 	p.udps = append(p.udps, addr)
+	p.mu.Unlock()
 	if p.udpFn != nil {
 		return p.udpFn(addr, payload)
 	}
