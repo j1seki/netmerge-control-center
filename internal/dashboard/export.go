@@ -6,13 +6,13 @@ package dashboard
 //
 // Three rules are structural here:
 //
-//   - Nothing leaves the machine. The export writes two files under the configured output
-//     directory when the user asks for that, and nothing else ever touches the network.
+//   - Nothing leaves the machine. The export writes the rendered files under the configured
+//     output directory when the user asks for that, and nothing else ever touches the network.
 //   - What the report does not have, it says. A missing snapshot, a failed TTL read or a
 //     diagnostics run that never happened each become a caveat in the document rather than
 //     silence that reads like a clean bill of health.
 //   - The placeholder-to-value mapping (Entries) is returned to the caller for display and is
-//     never part of either saved file.
+//     never part of any saved file.
 
 import (
 	"context"
@@ -62,18 +62,28 @@ func (s *Server) handleExportSave(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "dashboard_export_dir", "the output directory could not be created", err.Error())
 		return
 	}
-	txtPath, jsonPath := diagreport.Bundle{BaseName: e.BaseName}.WriteName(dir)
+	txtPath, mdPath, jsonPath := diagreport.Bundle{BaseName: e.BaseName}.WriteName(dir)
 	if err := os.WriteFile(txtPath, []byte(e.Text), 0o600); err != nil {
 		fail(w, http.StatusInternalServerError, "dashboard_export_write", "the text report could not be written", err.Error())
 		return
+	}
+	if e.Markdown != "" {
+		if err := os.WriteFile(mdPath, []byte(e.Markdown), 0o600); err != nil {
+			fail(w, http.StatusInternalServerError, "dashboard_export_write", "the Markdown report could not be written", err.Error())
+			return
+		}
 	}
 	if err := os.WriteFile(jsonPath, []byte(e.JSON), 0o600); err != nil {
 		fail(w, http.StatusInternalServerError, "dashboard_export_write", "the JSON report could not be written", err.Error())
 		return
 	}
-	j.markSaved([]string{txtPath, jsonPath})
-	logx.Eventf(logx.LevelInfo, "dashboard.export.save", "diagnostic export saved as %s (.txt and .json)", e.BaseName)
-	writeJSON(w, http.StatusOK, map[string]any{"saved": []string{txtPath, jsonPath}})
+	saved := []string{txtPath, jsonPath}
+	if e.Markdown != "" {
+		saved = append(saved, mdPath)
+	}
+	j.markSaved(saved)
+	logx.Eventf(logx.LevelInfo, "dashboard.export.save", "diagnostic export saved as %s (.txt, .md and .json)", e.BaseName)
+	writeJSON(w, http.StatusOK, map[string]any{"saved": saved})
 }
 
 // exportFn is the background job: assemble, render, redact.
@@ -147,6 +157,7 @@ func (s *Server) exportFn(ctx context.Context) (any, error) {
 	return exportResult{
 		BaseName: b.BaseName,
 		Text:     string(b.Text),
+		Markdown: string(b.Markdown),
 		JSON:     string(b.JSON),
 		Counts:   b.Counts,
 		Entries:  b.Entries,

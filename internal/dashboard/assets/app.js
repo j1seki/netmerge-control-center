@@ -5,7 +5,8 @@
  * One rule shapes this file: it renders whatever the server says, including when the server says
  * "unknown". Nothing here synthesises a value, and every placeholder for a missing fact stays
  * visibly missing. Long operations (diagnostics runs, exports) are started as jobs and polled,
- * so no button ever freezes the page.
+ * so no button ever freezes the page. Charts and meters are built from real collected samples
+ * only; an unavailable sample is drawn as a gap, never as a zero.
  */
 
 const TOKEN = window.NETMERGE_TOKEN || "";
@@ -36,6 +37,8 @@ function addKid(e, kid) {
 
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+function setAll(node, kids) { clear(node); addKid(node, kids); return node; }
+
 /* ---------- formatting ---------- */
 
 const UNKNOWN = "unknown";
@@ -48,6 +51,16 @@ function rate(v) {
   if (bps >= 1e6) return (bps / 1e6).toFixed(1) + " Mbit/s";
   if (bps >= 1e3) return (bps / 1e3).toFixed(1) + " kbit/s";
   return bps.toFixed(0) + " bit/s";
+}
+
+function rateShort(v) {
+  if (v === null || v === undefined) return "—";
+  const bps = Number(v);
+  if (!isFinite(bps)) return "—";
+  if (bps >= 1e9) return (bps / 1e9).toFixed(1) + "G";
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + "M";
+  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + "k";
+  return bps.toFixed(0);
 }
 
 function bytes(v) {
@@ -82,8 +95,6 @@ function dur(ms) {
   return Math.floor(s / 60) + "m " + (s % 60).toFixed(0) + "s";
 }
 
-/* Go marshals time.Duration as an integer number of nanoseconds, so anything that came out of a
-   Go struct goes through here rather than through dur(), which takes milliseconds. */
 function goDur(ns) {
   if (ns === null || ns === undefined) return "—";
   return dur(Number(ns) / 1e6);
@@ -97,6 +108,20 @@ function list(v) {
 function val(v, suffix) {
   if (v === null || v === undefined || v === "") return "—";
   return v + (suffix || "");
+}
+
+function nfmt(v) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  return n.toLocaleString();
+}
+
+function pct(v) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  return n.toFixed(1) + "%";
 }
 
 /* ---------- api ---------- */
@@ -129,7 +154,7 @@ function toast(kind, message, details, code) {
     h("strong", null, message),
     info ? h("div", { class: "small", style: "margin-top:4px" }, info.meaning) : null,
     info && info.fix ? h("div", { class: "small dim", style: "margin-top:4px" }, info.fix) : null,
-    details ? h("div", { class: "small mono", style: "margin-top:4px" }, typeof details === "string" ? details : JSON.stringify(details, null, 2)) : null,
+    details ? h("div", { class: "small mono", style: "margin-top:4px;white-space:pre-wrap" }, typeof details === "string" ? details : JSON.stringify(details, null, 2)) : null,
     h("div", { class: "row", style: "margin-top:6px" },
       h("button", {
         class: "btn secondary small", onclick: (ev) => {
@@ -137,12 +162,19 @@ function toast(kind, message, details, code) {
           const body = ["code: " + (code || "(none)"), "message: " + message,
             info ? "meaning: " + info.meaning : "", info && info.fix ? "next step: " + info.fix : "",
             details ? "details: " + (typeof details === "string" ? details : JSON.stringify(details)) : ""].filter(Boolean).join("\n");
-          navigator.clipboard.writeText(body).then(() => toast("ok", "Error details copied."), () => toast("warn", "Clipboard access was refused by the browser."));
+          copyText(body, "Error details copied.");
         }
       }, "Copy error details"),
       h("span", { class: "small dim", style: "margin-left:8px" }, "click to dismiss")));
   box.append(n);
   setTimeout(() => n.remove(), 12000);
+}
+
+function copyText(text, okMsg) {
+  navigator.clipboard.writeText(text).then(
+    () => toast("ok", okMsg || "Copied to clipboard."),
+    () => toast("warn", "Clipboard access was refused by the browser."),
+  );
 }
 
 async function guard(fn, busy) {
@@ -152,8 +184,6 @@ async function guard(fn, busy) {
   finally { if (busy) busy.disabled = false; }
 }
 
-/* The application's error-code registry, so a code is never left unexplained. Loaded once at
-   startup; until it arrives, toasts simply show the code without the prose. */
 let codeRegistry = null;
 function codeInfo(code) { return codeRegistry ? codeRegistry[code] : null; }
 async function loadCodeRegistry() {
@@ -172,29 +202,134 @@ let ttlReport = null;
 let openAdapters = new Set();
 let logCursor = 0;
 let logTimer = null;
+let logSelected = new Set();
 let lastDiag = null;
 let lastExport = null;
 let exportJobId = null;
 let diagJobId = null;
+let currentView = "overview";
+// rolling throughput history, keyed by adapter index, so charts read real samples only
+let history = [];
+const HISTORY_MAX = 60;
 
 const STATUS_CLASS = { pass: "ok", warn: "warn", fail: "bad", error: "bad", skipped: "skip", info: "info" };
-function tag(status) {
+function statusTag(status) {
   const cls = STATUS_CLASS[status] || "info";
-  return h("span", { class: "tag " + cls }, status || UNKNOWN);
+  return h("span", { class: "tag " + cls }, h("span", { class: "dot" }), status || UNKNOWN);
 }
 
-/* ================= views ================= */
+/* ---------- shared small components ---------- */
+
+// card(k, v, sub, opts) renders a metric card. sub is a short caption shown inline beside the
+// value; opts takes sub (a caption on its own line below), tone, spark, icon, small, onclick.
+// Passing an object where the caption is expected must never stringify into the card as
+// "[object Object]".
+function card(k, v, sub, opts) {
+  if (typeof sub === "object" && sub !== null) { opts = sub; sub = opts.inline || null; }
+  opts = opts || {};
+  const kids = [h("span", { class: "accent" }), h("div", { class: "k" }, k,
+    opts.icon ? h("span", null, opts.icon) : null)];
+  const vcls = "v" + (opts.tone ? " " + opts.tone : "") + (opts.small ? " sm" : "");
+  kids.push(h("div", { class: vcls }, v === null || v === undefined ? "—" : v,
+    sub ? h("small", null, " " + sub) : null));
+  if (opts.sub) kids.push(h("div", { class: "sub" }, opts.sub));
+  if (opts.spark) kids.push(h("div", { class: "spark" }, opts.spark));
+  return h("div", { class: "card" + (opts.tone ? " is-" + opts.tone : "") + (opts.onclick ? " clickable" : ""), onclick: opts.onclick }, kids);
+}
+
+function meter(value, max, tone) {
+  const frac = (value === null || value === undefined || !max) ? 0 : Math.max(0, Math.min(1, value / max));
+  return h("div", { class: "meter" + (tone ? " " + tone : "") }, h("span", { style: "width:" + (frac * 100).toFixed(1) + "%" }));
+}
+
+// A bar chart from a real series. null entries are drawn as gaps so "unknown" never looks like 0.
+// When opts.second is given, every slot carries two bars side by side (the primary series and the
+// second one), so a legend that names two series always describes two that are actually drawn.
+function chart(series, opts) {
+  opts = opts || {};
+  const second = opts.second || null;
+  const all = second ? series.concat(second) : series;
+  const max = Math.max(1e-6, ...all.filter((v) => v !== null && v !== undefined).map(Number));
+  const barFor = (v, out) => {
+    if (v === null || v === undefined) return h("div", { class: "bar", style: "height:0;background:var(--line2)", title: "no sample" });
+    const frac = Math.max(0.04, Number(v) / max);
+    return h("div", { class: "bar" + (out ? " out" : ""), style: "height:" + (frac * 100).toFixed(1) + "%", title: opts.fmt ? opts.fmt(v) : String(v) });
+  };
+  const bars = series.map((v, i) => {
+    if (!second) return barFor(v, opts.out);
+    // A paired slot: the two bars share one column so the eye compares them directly.
+    return h("div", { class: "pair" }, barFor(v, false), barFor(second[i], true));
+  });
+  return h("div", { class: "chart" + (opts.tall ? " tall" : "") }, bars);
+}
+
+function legend(items) {
+  return h("div", { class: "chart-legend" }, items.map(([color, label]) =>
+    h("span", null, h("span", { class: "sw", style: "background:" + color }), label)));
+}
+
+function emptyState(icon, big, small) {
+  return h("div", { class: "empty" }, h("div", { class: "ic" }, icon),
+    h("div", { class: "big" }, big), small ? h("div", { class: "small" }, small) : null);
+}
+
+function kvList(pairs) {
+  const dl = h("dl", { class: "kv" });
+  pairs.forEach(([k, v]) => { dl.append(h("dt", null, k), h("dd", null, v === null || v === undefined || v === "" ? "—" : v)); });
+  return dl;
+}
+
+function section(title, hint, body, opts) {
+  opts = opts || {};
+  return h("div", { class: "panel" }, h("h3", null, title, hint ? h("span", { class: "hint" }, hint) : null, opts.actions ? h("span", { class: "grow" }) : null, opts.actions || null), body);
+}
+
+function exp(summaryText, body, hint) {
+  return h("details", { class: "exp" },
+    h("summary", null, summaryText, hint ? h("span", { class: "hint dim small" }, hint) : null),
+    h("div", { class: "exp-body" }, body));
+}
+
+function badge(text, tone) { return h("span", { class: "tag " + (tone || "") }, text); }
+
+// The confirm modal used for anything that changes a live system setting.
+function confirmModal(opts) {
+  return new Promise((resolve) => {
+    const back = h("div", { class: "modal-back" });
+    const done = (v) => { back.remove(); resolve(v); };
+    const body = h("div", { class: "mbody" });
+    addKid(body, opts.body);
+    const m = h("div", { class: "modal" },
+      h("div", { class: "mhead" }, h("h3", null, opts.title || "Confirm")),
+      body,
+      h("div", { class: "mfoot" },
+        h("button", { class: "btn secondary", onclick: () => done(false) }, opts.cancel || "Cancel"),
+        h("button", { class: "btn " + (opts.danger ? "danger" : "primary"), onclick: () => done(true) }, opts.confirm || "Confirm")));
+    back.append(m);
+    back.addEventListener("click", (e) => { if (e.target === back) done(false); });
+    document.body.append(back);
+  });
+}
+
+/* ---------- view switching ---------- */
+
+const VIEW_TITLES = {
+  overview: "Overview", connections: "Connections", routing: "Routing",
+  ttl: "TTL / Hop limit", diag: "Diagnostics", logs: "Logs", settings: "Profiles & Settings",
+};
 
 function showView(name) {
+  currentView = name;
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
-  document.querySelectorAll("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  document.querySelectorAll("#nav button, #nav2 button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   const view = $("#view-" + name);
   if (view) view.classList.add("active");
+  document.title = (VIEW_TITLES[name] || "NetMerge") + " · NetMerge Control Center";
   if (name === "ttl" && !ttlReport) loadTTL();
   if (name === "diag") { ensureChecks(); }
   if (name === "logs") startLogs(); else stopLogs();
   if (name === "settings") loadSettings();
-  if (name === "connections" || name === "routing" || name === "overview") renderAll();
+  if (name === "overview" || name === "connections" || name === "routing") renderAll();
 }
 
 /* ---------- overview ---------- */
@@ -204,90 +339,104 @@ function renderBadge() {
   clear(b);
   const on = state && state.engineOn;
   const st = state && state.engine;
+  b.className = on ? "on" : "";
   b.append(
-    h("span", { class: "tag " + (on ? "ok" : "skip") }, on ? "engine ON" : "engine OFF"),
+    h("span", { class: "pill" }, h("span", { class: "dot" }), on ? "Engine ON" : "Engine OFF"),
     h("span", { class: "small dim" }, st && st.mode ? st.mode : (on ? "" : "idle")));
 }
 
+// record real samples for the traffic chart
+function pushHistory(snap) {
+  if (!snap) return;
+  history.push({ at: Date.now(), inRate: snap.inPerSecTotal || 0, outRate: snap.outPerSecTotal || 0 });
+  if (history.length > HISTORY_MAX) history.shift();
+}
+
 function renderOverview() {
+  const snap = state && state.snapshot;
+  pushHistory(snap);
+
+  // summary strip
+  const strip = $("#ovSummary");
+  const adapters = (snap && snap.adapters) || [];
+  const eligible = adapters.filter((a) => !a.exclusionCode);
+  const inUse = adapters.filter((a) => a.engine);
+  const healthy = adapters.filter((a) => a.health && a.health.checked && a.health.ok);
+  clear(strip);
+  strip.append(
+    seg("Eligible links", eligible.length + " / " + adapters.length, eligible.length ? "ok" : "dim"),
+    seg("In engine", inUse.length ? String(inUse.length) : (state && state.engineOn ? "0" : "off"), inUse.length ? "ok" : "dim"),
+    seg("Reachable", healthy.length ? String(healthy.length) : "—", healthy.length ? "ok" : "dim"),
+    seg("Engine", state && state.engineOn ? "ON" : "OFF", state && state.engineOn ? "ok" : "dim"),
+  );
+
+  // warnings / gaps / errors
+  const warnings = $("#ovWarnings");
+  clear(warnings);
+  if (state) {
+    if (state.collecting) warnings.append(h("div", { class: "notice info" }, "The monitor has not completed its first adapter read yet."));
+    if (state.collectError) warnings.append(h("div", { class: "notice bad" }, "The last adapter snapshot failed: " + state.collectError,
+      h("div", { class: "small dim" }, "The view below is from the previous successful read.")));
+    if (snap) {
+      (snap.warnings || []).forEach((w) => warnings.append(h("div", { class: "notice warn" }, w)));
+      (snap.errors || []).forEach((w) => warnings.append(h("div", { class: "notice bad" }, w)));
+      (snap.gaps || []).forEach((w) => warnings.append(h("div", { class: "notice info" }, w)));
+    }
+  }
+
+  // headline cards
   const cards = $("#ovCards");
   clear(cards);
-  const snap = state && state.snapshot;
-
   const inTot = snap ? snap.inPerSecTotal : null;
   const outTot = snap ? snap.outPerSecTotal : null;
   cards.append(
-    card("Aggregate throughput", (rate(inTot) + " ↓ / " + rate(outTot) + " ↑"), "sum of measured per-link rates"),
-    card("Links", snap ? String(snap.adapters ? snap.adapters.length : 0) : "—",
-      snap ? (eligibleCount(snap) + " eligible") : "no snapshot yet"),
-    card("Link speed total", snap && snap.linkSpeedTotalBps ? rate(snap.linkSpeedTotalBps) : "—",
-      "negotiated speed, not throughput"),
-    card("Engine", state && state.engineOn ? "ON" : "OFF",
-      state && state.engine && state.engine.v6 ? "IPv6: " + state.engine.v6 : ""),
+    card("Throughput ↓ down", rate(inTot), { sub: "sum of measured per-link rates", tone: "info", spark: sparkline("in") }),
+    card("Throughput ↑ up", rate(outTot), { sub: "sum of measured per-link rates", tone: "cyan", spark: sparkline("out", true) }),
+    card("Negotiated link speed", snap && snap.linkSpeedTotalBps ? rate(snap.linkSpeedTotalBps) : "—", { sub: "hardware speed, not achievable throughput" }),
   );
 
-  const warnings = $("#ovWarnings");
-  clear(warnings);
-  if (!state) return;
-  if (state.collecting) {
-    warnings.append(h("div", { class: "notice info" }, "The monitor has not completed its first adapter read yet."));
-  }
-  if (state.collectError) {
-    warnings.append(h("div", { class: "notice bad" }, "The last adapter snapshot failed: " + state.collectError,
-      h("div", { class: "small dim" }, "The view below is from the previous successful read.")));
-  }
-  if (snap) {
-    (snap.warnings || []).forEach((w) => warnings.append(h("div", { class: "notice warn" }, w)));
-    (snap.errors || []).forEach((w) => warnings.append(h("div", { class: "notice bad" }, w)));
-    (snap.gaps || []).forEach((w) => warnings.append(h("div", { class: "notice info" }, w)));
-  }
-
-  const links = $("#ovLinks");
-  clear(links);
-  if (!snap || !snap.adapters || !snap.adapters.length) {
-    links.append(h("div", { class: "dim" }, "No adapters in the current snapshot."));
+  // traffic panel with a shared dual chart
+  const traffic = $("#ovTraffic");
+  clear(traffic);
+  if (history.length < 2) {
+    traffic.append(emptyState("📶", "Collecting samples…", "Throughput history builds from the monitor's real counter reads; a gap or two will fill in shortly."));
   } else {
-    links.append(linkTable(snap.adapters, false));
+    const inSeries = history.map((p) => p.inRate || 0);
+    const outSeries = history.map((p) => p.outRate || 0);
+    traffic.append(
+      chart(inSeries, { tall: true, fmt: rate, second: outSeries }),
+      legend([["var(--accent)", "download (in)"], ["var(--cyan)", "upload (out)"], ["var(--line2)", "window ≈ " + (HISTORY_MAX * (state && state.monitor && state.monitor.intervalMs ? state.monitor.intervalMs : 2000) / 1000) + "s"]]),
+      h("div", { class: "small dim mt" }, "Each bar is one monitor interval's measured aggregate rate across eligible adapters. This is measured movement, not a claim about maximum achievable bandwidth."),
+    );
   }
 
+  // engine
   const eng = $("#ovEngine");
   clear(eng);
   eng.append(engineBlock());
+
+  renderNavCounts();
+}
+
+function seg(k, v, tone) {
+  return h("div", { class: "seg" }, h("div", { class: "sk" }, k),
+    h("div", { class: "sv " + (tone === "ok" ? "" : "dim"), style: tone === "ok" ? "color:var(--ok)" : "" }, v));
+}
+
+function sparkline(dir, out) {
+  const series = history.slice(-40).map((p) => (out ? p.outRate : p.inRate) || 0);
+  if (series.length < 2) return h("div", { class: "tiny faint" }, "collecting…");
+  return chart(series, { out: !!out });
+}
+
+function renderNavCounts() {
+  const c = $("#navConnCount");
+  const adapters = (state && state.snapshot && state.snapshot.adapters) || [];
+  if (c) c.textContent = adapters.length ? String(adapters.length) : "";
 }
 
 function eligibleCount(snap) {
   return (snap.adapters || []).filter((a) => !a.exclusionCode).length;
-}
-
-function card(k, v, sub) {
-  return h("div", { class: "card" },
-    h("div", { class: "k" }, k),
-    h("div", { class: "v" }, v, sub ? h("small", null, " " + sub) : null));
-}
-
-function linkTable(adapters, detailed) {
-  const head = detailed
-    ? ["Adapter", "Kind", "Status", "Link", "Engine", "Down", "Up", "Speed", "Exclusion"]
-    : ["Adapter", "Kind", "Status", "Link", "Engine", "Down", "Up", "Exclusion"];
-  const t = h("table", null, h("thead", null, h("tr", null, head.map((c, i) => h("th", { class: i >= 5 && i <= 8 ? "num" : "" }, c))))); 
-  const body = h("tbody");
-  adapters.forEach((a) => {
-    const r = a.rates || {};
-    body.append(h("tr", null,
-      h("td", null, h("strong", null, a.name), a.description ? h("div", { class: "small dim" }, a.description) : null),
-      h("td", null, a.kind || UNKNOWN),
-      h("td", null, h("span", { class: "tag " + (a.status === "active" ? "ok" : a.status === "eligible" ? "info" : a.status === "unhealthy" ? "warn" : "skip") }, a.status || UNKNOWN)),
-      h("td", null, a.link || UNKNOWN),
-      h("td", null, a.engine ? h("span", { class: "tag ok" }, "in use") : h("span", { class: "dim small" }, "not used")),
-      h("td", { class: "num" }, rate(r.inPerSec)),
-      h("td", { class: "num" }, rate(r.outPerSec)),
-      detailed ? h("td", { class: "num" }, a.speedBps ? rate(a.speedBps) : "—") : null,
-      h("td", null, a.exclusionCode
-        ? h("div", null, h("span", { class: "tag warn" }, a.exclusionCode), h("div", { class: "small dim" }, a.exclusion || ""))
-        : h("span", { class: "tag ok" }, "eligible"))));
-  });
-  t.append(body);
-  return t;
 }
 
 function engineBlock() {
@@ -296,873 +445,1148 @@ function engineBlock() {
     wrap.append(
       h("div", { class: "dim" }, "The engine is off. Routes are normal: nothing is aggregated, and the adapter controls are idle."),
       h("div", { class: "row spread" },
-        h("button", { class: "btn", onclick: (e) => engineAction("on", e.target) }, "Turn engine ON"),
+        h("button", { class: "btn primary", onclick: (e) => engineAction("on", e.target) }, "Turn engine ON"),
         h("span", { class: "small dim" }, "Turning it on needs administrator rights; the engine will ask for elevation itself.")),
     );
     return wrap;
   }
   const st = state.engine;
-  wrap.append(h("div", { class: "row spread" },
+  wrap.append(h("div", { class: "row between" },
     h("div", null,
       h("div", null, "Mode: ", h("strong", null, st.mode || UNKNOWN), " · IPv6: ", st.v6 || UNKNOWN,
         " · pid ", st.pid, " · up ", st.since ? dur(Date.now() - Date.parse(st.since)) : "—"),
-      h("div", { class: "small dim" }, "Status written by the engine at ", stamp(st.updated), ".")),
-    h("button", { class: "btn danger", onclick: (e) => engineAction("off", e.target) }, "Turn engine OFF")));
+      h("div", { class: "small dim mt" }, "Status written by the engine at ", stamp(st.updated), ".")),
+    h("div", { class: "row tight" },
+      h("button", { class: "btn secondary", onclick: (e) => engineAction("off", e.target) }, "Pause"),
+      h("button", { class: "btn danger", onclick: (e) => engineAction("quit", e.target) }, "Quit engine"))));
   if (st.nics && st.nics.length) {
-    const t = h("table", { class: "mt" }, h("thead", null, h("tr", null,
-      ["Link", "State4", "State6", "Link ↓", "Link ↑", "via net-merge", "active", "total", "weight", "failed"].map((c, i) => h("th", { class: i >= 3 ? "num" : "" }, c)))));
-    const body = h("tbody");
-    st.nics.forEach((n) => body.append(h("tr", null,
-      h("td", null, n.name, n.present === false ? h("span", { class: "tag warn" }, " gone") : null),
-      h("td", null, n.state || "—"), h("td", null, n.state6 || "—"),
-      h("td", { class: "num" }, rate((n.linkIn || 0) * 8)),
-      h("td", { class: "num" }, rate((n.linkOut || 0) * 8)),
-      h("td", { class: "num" }, rate(((n.rateIn || 0) + (n.rateOut || 0)) * 8)),
-      h("td", { class: "num" }, n.active), h("td", { class: "num" }, n.total),
-      h("td", { class: "num" }, (n.weight !== undefined ? n.weight : "—") + " / " + (n.weight6 !== undefined ? n.weight6 : "—")),
-      h("td", { class: "num" }, n.failed))));
-    t.append(body);
-    wrap.append(t);
-    wrap.append(h("div", { class: "small dim mt" },
-      "\"Link\" is the adapter's total traffic read from the OS counters, including apps that bypass net-merge. \"via net-merge\" is the part the engine relayed."));
+    wrap.append(h("div", { class: "mt" }, engineNicTable(st.nics)));
   }
   return wrap;
 }
 
+function engineNicTable(nics) {
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["Adapter", "IPv4", "IPv6", "Weight", "State", "Active", "Failed", "Bytes in", "Bytes out"].map((c, i) =>
+      h("th", { class: i >= 4 ? "num" : "" }, c)))));
+  const body = h("tbody");
+  nics.forEach((l) => {
+    body.append(h("tr", null,
+      h("td", null, h("strong", null, l.name), l.present === false ? h("span", { class: "tag warn", style: "margin-left:6px" }, "absent") : null),
+      h("td", { class: "mono small" }, l.ip || "—"),
+      h("td", { class: "mono small" }, l.ip6 || "—"),
+      h("td", { class: "num" }, l.weight ? l.weight.toFixed(2) : "—"),
+      h("td", { class: "num small" }, (l.state || "") + (l.state6 && l.state6 !== "-" ? " / " + l.state6 : "")),
+      h("td", { class: "num" }, nfmt(l.active)),
+      h("td", { class: "num" }, l.failed ? nfmt(l.failed) : "0"),
+      h("td", { class: "num" }, bytes(l.bytesIn)),
+      h("td", { class: "num" }, bytes(l.bytesOut))));
+  });
+  t.append(body);
+  return t;
+}
+
 async function engineAction(action, btn) {
-  if (action !== "on" && !confirm("Turn the bonding engine " + action.toUpperCase() + "? Existing connections are routed back to normal networking.")) return;
   await guard(async () => {
-    await api("/api/engine", { method: "POST", body: { action } });
-    toast("ok", "Engine " + (action === "on" ? "starting" : action === "quit" ? "quitting" : "stopping") + ".");
-    await pollStateOnce();
+    const d = await api("/api/engine", { method: "POST", body: { action: action } });
+    toast("ok", d.message || ("Engine " + action + " requested."), d.detail);
+    // give the marker a moment, then refresh
+    setTimeout(pollStateOnce, 400);
   }, btn);
 }
 
 /* ---------- connections ---------- */
 
+const KIND_ICON = {
+  ethernet: ["Ethernet", "⇅", "ethernet"], wifi: ["Wi-Fi", "📶", "wifi"],
+  "usb-tether": ["USB tether", "📱", "tether"], modem: ["Modem", "📡", "tether"],
+  vpn: ["VPN", "🔒", "vpn"], other: ["Other", "•", ""],
+};
+
+function kindChip(a) {
+  const [label, ic, cls] = KIND_ICON[a.kind] || KIND_ICON.other;
+  return h("span", { class: "kind-ic " + cls, title: label }, ic);
+}
+
 function renderConnections() {
   const body = $("#connBody");
   const snap = state && state.snapshot;
-  const count = $("#connCount");
-  const mon = state && state.monitor;
+  const adapters = (snap && snap.adapters) || [];
+  const cc = $("#connCount");
+  if (cc) cc.textContent = adapters.length
+    ? adapters.length + " adapter" + (adapters.length === 1 ? "" : "s") + " · " + eligibleCount(snap) + " eligible for bonding"
+    : "";
+
   clear(body);
-  if (!snap) { clear(count); count.textContent = "No snapshot yet."; body.append(h("div", { class: "notice info" }, "Waiting for the first adapter read.")); return; }
-  count.textContent = snap.adapters.length + " adapters · snapshot from " + stamp(snap.taken) + " · source " + (snap.source || UNKNOWN);
-  if (mon) {
-    count.textContent += mon.enabled
-      ? " · reachability probe to " + (mon.endpoint || UNKNOWN) + " every " + dur(mon.intervalMs)
-      : " · reachability probe off";
+  if (!adapters.length) {
+    body.append(emptyState("🔌", "No adapters in the current snapshot.",
+      state && state.collecting ? "The monitor is still reading interfaces for the first time." : "Nothing was reported by the platform's interface reader."));
+    return;
   }
-  if (mon && !mon.enabled) {
-    body.append(h("div", { class: "notice info" },
-      "The reachability probe is off (dashboard.healthIntervalMs is negative in settings). ",
-      h("strong", null, "“not tested” below means exactly that"), " — nothing here is a claim that a link does or does not work."));
-  }
-  snap.adapters.forEach((a) => body.append(adapterCard(a)));
-}
-
-// monitorLink finds the reachability monitor's view of one adapter, which carries the state
-// the per-adapter health snapshot does not: since when, and how many changes it has seen.
-function monitorLink(name) {
-  const links = (state && state.monitor && state.monitor.links) || [];
-  for (let i = 0; i < links.length; i++) if (links[i].name === name) return links[i];
-  return null;
-}
-
-// healthText renders one adapter's reachability. Every part that is unknown is said to be
-// unknown; an untested adapter never renders as a healthy one.
-function healthText(a) {
-  const link = monitorLink(a.name);
-  const parts = [];
-  if (link) {
-    parts.push(link.state === "reachable" ? "reachable"
-      : link.state === "unreachable" ? "not answering"
-      : link.state === "absent" ? "gone from the last check"
-      : "not checked yet");
-  } else if (a.health) {
-    parts.push(a.health.ok ? "reachable" : "did not answer");
-  }
-  if (a.health) {
-    if (a.health.rttMs) parts.push(a.health.rttMs.toFixed(1) + " ms");
-    if (a.health.lossPct) parts.push("loss " + a.health.lossPct.toFixed(0) + "% in the recent window");
-    if (a.health.jitterMs) parts.push("jitter " + a.health.jitterMs.toFixed(1) + " ms");
-    if (a.health.endpoint) parts.push("via " + a.health.endpoint);
-    if (a.health.detail) parts.push(a.health.detail);
-    if (a.health.at) parts.push("at " + stamp(a.health.at));
-  }
-  if (link && link.changes) parts.push("state changed " + link.changes + "× — last " + stamp(link.since));
-  return parts.length ? parts.join(" · ") : "— not tested";
+  const grid = h("div", { class: "adapters" });
+  adapters.forEach((a) => grid.append(adapterCard(a)));
+  body.append(grid);
 }
 
 function adapterCard(a) {
+  const excluded = !!a.exclusionCode;
   const open = openAdapters.has(a.name);
-  const det = h("details", open ? { open: true } : {},
-    h("summary", null,
-      h("strong", null, a.name), " ",
-      h("span", { class: "tag " + (a.status === "active" ? "ok" : a.status === "eligible" ? "info" : a.status === "unhealthy" ? "warn" : "skip") }, a.status || UNKNOWN),
-      a.exclusionCode ? h("span", { class: "tag warn", style: "margin-left:6px" }, a.exclusionCode) : null,
-      a.engine ? h("span", { class: "tag ok", style: "margin-left:6px" }, "engine") : null),
-    h("div", { class: "small", style: "margin:8px 0 0" }));
+  const [kindLabel] = KIND_ICON[a.kind] || KIND_ICON.other;
+  const r = a.rates || {};
 
-  det.addEventListener("toggle", () => {
-    if (det.open) openAdapters.add(a.name); else openAdapters.delete(a.name);
-  });
-
-  const grid = det.lastChild;
-  const rows = [
-    ["Interface GUID", a.guid || "— (this platform has no per-interface GUID)"],
-    ["Interface index", "IPv4 " + a.index + (a.indexV6 ? " · IPv6 " + a.indexV6 : "")],
-    ["Alias / description", (a.ifAlias || "—") + " · " + (a.description || "—")],
-    ["Kind", (a.kind || UNKNOWN) + (a.hardware === false ? " (virtual: " + (a.virtualReason || "marked virtual") + ")" : "")],
-    ["Operational state", (a.status || UNKNOWN) + " · admin " + (a.admin || UNKNOWN) + " · media " + (a.media || UNKNOWN)],
-    ["Media / link speed", (a.mediaType || "—") + " · " + (a.speedBps ? rate(a.speedBps) : "speed unknown")],
-    ["MAC", a.mac || "—"],
-    ["MTU", val(a.mtu) + (a.mtu4 || a.mtu6 ? " (v4 " + (a.mtu4 || "—") + ", v6 " + (a.mtu6 || "—") + ")" : "")],
-    ["IPv4", addrList(a.ipv4)],
-    ["IPv6", addrList(a.ipv6)],
-    ["Default gateways", "v4: " + list(a.gateways4) + " · v6: " + list(a.gateways6)],
-    ["Default route", (a.defaultRoute4 ? "v4 yes" : "v4 none") + " · " + (a.defaultRoute6 ? "v6 yes" : "v6 none")],
-    ["DNS", "v4: " + list(a.dns4) + " · v6: " + list(a.dns6)],
-    ["DHCP", "v4: " + tri(a.dhcp4) + " · v6: " + tri(a.dhcp6)],
-    ["Interface metric", "v4: " + ival(a.metric4) + " · v6: " + ival(a.metric6)],
-    ["Routes", (a.routeCount || (a.routes || []).length) + " in the table" + (a.defaultRoutes && a.defaultRoutes.length ? " · " + a.defaultRoutes.length + " default" : "")],
-    ["Counters", a.counters ? ("received " + bytes(a.counters.in) + " · sent " + bytes(a.counters.out)) : "— not available on this platform"],
-    ["Rates", a.rates ? (rate(a.rates.inPerSec) + " ↓ / " + rate(a.rates.outPerSec) + " ↑ over " + (a.rates.spanSeconds ? a.rates.spanSeconds.toFixed(1) + "s" : "one interval")) : "— no rate yet (this is not zero: it means the counters have not been observed twice)"],
-    ["Health probe", healthText(a)],
-    ["Engine use", a.engine ? "yes" : "no" + (a.exclusionCode ? " (excluded)" : "")],
-    ["Connections assigned by engine", a.engineAssigned === null || a.engineAssigned === undefined ? "— the engine does not report this" : String(a.engineAssigned)],
-  ];
-  const t = h("table");
-  rows.forEach(([k, v]) => t.append(h("tr", null, h("td", { class: "dim", style: "width:210px" }, k), h("td", null, v))));
-  grid.append(t);
-
-  if (a.exclusion || a.exclusionCode) {
-    grid.append(h("div", { class: "notice warn" }, h("strong", null, "Excluded: " + (a.exclusionCode || "")), " ", a.exclusion || ""));
+  const chips = h("div", { class: "achips" });
+  chips.append(badge(a.status || UNKNOWN, a.status === "active" ? "ok" : a.status === "eligible" ? "info" : a.status === "unhealthy" ? "warn" : "skip"));
+  chips.append(badge(kindLabel, "skip"));
+  if (a.engine) chips.append(badge("in engine", "ok"));
+  if (a.hardware === false) chips.append(badge("virtual", "skip"));
+  if (a.health) {
+    if (!a.health.checked) chips.append(badge("not probed", "skip"));
+    else if (a.health.ok) chips.append(badge("reachable" + (a.health.rttMs ? " " + a.health.rttMs.toFixed(0) + "ms" : ""), "ok"));
+    else chips.append(badge("unreachable", "bad"));
   }
-  if (a.gaps && a.gaps.length) grid.append(h("div", { class: "notice info" }, h("strong", null, "Not known for this adapter: "), a.gaps.join("; ")));
-  if (a.warnings && a.warnings.length) grid.append(h("div", { class: "notice warn" }, h("strong", null, "Warnings: "), a.warnings.join("; ")));
-  if (a.defaultRoutes && a.defaultRoutes.length) {
-    const rt = h("table", { class: "mt" }, h("thead", null, h("tr", null, ["Destination", "Gateway", "Metric", "Family"].map((c) => h("th", null, c)))));
-    const rb = h("tbody");
-    a.defaultRoutes.forEach((r) => rb.append(h("tr", null, h("td", null, r.destination), h("td", null, r.gateway || "on-link"), h("td", null, ival(r.metric)), h("td", null, r.family || ""))));
-    rt.append(rb);
-    grid.append(h("div", { class: "small dim mt" }, "Default routes"), rt);
-  }
-  return h("div", { class: "panel" }, det);
+  if (excluded) chips.append(badge(a.exclusionCode, "warn"));
+
+  const rates = h("div", { class: "arates" },
+    h("div", { class: "arate" }, h("div", { class: "rk" }, "↓ down"), h("div", { class: "rv in" }, rateShort(r.inPerSec), h("span", { class: "tiny dim" }, " bit/s"))),
+    h("div", { class: "arate" }, h("div", { class: "rk" }, "↑ up"), h("div", { class: "rv out" }, rateShort(r.outPerSec), h("span", { class: "tiny dim" }, " bit/s"))),
+    h("div", { class: "arate" }, h("div", { class: "rk" }, "link speed"), h("div", { class: "rv" }, a.speedBps ? rateShort(a.speedBps) : "—", a.speedBps ? h("span", { class: "tiny dim" }, " bit/s") : null)),
+  );
+
+  const cardEl = h("div", { class: "acard" + (excluded ? " excluded" : "") },
+    h("div", { class: "ahead" },
+      h("div", { class: "grow" },
+        h("div", { class: "aname" }, kindChip(a), a.name),
+        a.description ? h("div", { class: "adesc" }, a.description) : null),
+      h("button", { class: "btn ghost sm", onclick: () => { toggleAdapter(a.name); } }, open ? "▾ Hide" : "▸ Detail")),
+    chips,
+    rates,
+    h("div", { class: "small dim mt" }, a.link || "link state unknown",
+      a.exclusion ? h("div", { class: "small", style: "color:var(--warn);margin-top:3px" }, a.exclusion) : null),
+    open ? adapterDetail(a) : null,
+  );
+  return cardEl;
 }
 
-function addrList(addrs) {
-  if (!addrs || !addrs.length) return "—";
-  return addrs.map((a) => a.address + "/" + a.prefix + (a.tentative ? " (tentative)" : "") + (a.origin ? " [" + a.origin + "]" : "")).join(", ");
+function toggleAdapter(name) {
+  if (openAdapters.has(name)) openAdapters.delete(name); else openAdapters.add(name);
+  renderConnections();
 }
+
+function adapterDetail(a) {
+  const d = h("div", { class: "adetail" });
+  const pairs = [];
+  pairs.push(["IPv4", a.ipv4 && a.ipv4.length ? a.ipv4.map((x) => x.address + (x.prefixLength ? "/" + x.prefixLength : "")).join(", ") : "—"]);
+  pairs.push(["IPv6", a.ipv6 && a.ipv6.length ? a.ipv6.map((x) => x.address + (x.prefixLength ? "/" + x.prefixLength : "")).join(", ") : "—"]);
+  if (a.gateways4 && a.gateways4.length) pairs.push(["Gateway v4", a.gateways4.join(", ")]);
+  if (a.gateways6 && a.gateways6.length) pairs.push(["Gateway v6", a.gateways6.join(", ")]);
+  if (a.dns4 && a.dns4.length) pairs.push(["DNS v4", a.dns4.join(", ")]);
+  if (a.dns6 && a.dns6.length) pairs.push(["DNS v6", a.dns6.join(", ")]);
+  // tri() returns a real element, so the pieces are passed as separate children rather than
+  // concatenated into a string - which would stringify the element as "[object HTMLSpanElement]".
+  pairs.push(["DHCP", ["v4: ", tri(a.dhcp4), " \u00b7 v6: ", tri(a.dhcp6)]]);
+  if (a.mtu) pairs.push(["MTU", String(a.mtu)]);
+  if (a.mac) pairs.push(["MAC", a.mac]);
+  if (a.driverProvider) pairs.push(["Driver", a.driverProvider + (a.driverVersion ? " " + a.driverVersion : "")]);
+  if (a.counters) pairs.push(["Totals", "in " + bytes(a.counters.in) + " · out " + bytes(a.counters.out)]);
+  if (a.engineAssigned !== null && a.engineAssigned !== undefined) pairs.push(["Engine assigned", String(a.engineAssigned)]);
+  d.append(kvList(pairs));
+  if (a.health && a.health.checked) {
+    d.append(h("div", { class: "small mt" }, "Probe: ", a.health.ok ? statusTag("pass") : statusTag("fail"),
+      " ", h("span", { class: "dim" }, (a.health.rttMs ? "rtt " + a.health.rttMs.toFixed(1) + "ms · " : "") +
+        (a.health.lossPct !== undefined ? "loss " + pct(a.health.lossPct) + " · " : "") +
+        (a.health.endpoint ? "to " + a.health.endpoint : ""))));
+  }
+  (a.warnings || []).forEach((w) => d.append(h("div", { class: "notice warn small" }, w)));
+  (a.gaps || []).forEach((g) => d.append(h("div", { class: "notice info small" }, g)));
+  return d;
+}
+
 function tri(v) {
-  if (v === true) return "yes";
-  if (v === false) return "no";
-  return "not known";
+  if (v === "yes") return h("span", { class: "tag ok" }, "yes");
+  if (v === "no") return h("span", { class: "tag skip" }, "no");
+  return h("span", { class: "tag skip" }, "unknown");
 }
-function ival(v) { return v === null || v === undefined ? "—" : String(v); }
 
 /* ---------- routing ---------- */
 
 function renderRouting() {
-  const prof = $("#routeProfile");
-  clear(prof);
+  // active profile summary
+  const rp = $("#routeProfile");
+  clear(rp);
   const cfg = state && state.settings;
-  if (!cfg) { prof.append(h("div", { class: "dim" }, "Settings are not readable, so the active profile is unknown.")); }
-  else {
-    const p = (cfg.profiles || {})[cfg.activeProfile];
-    if (!p) {
-      prof.append(h("div", { class: "notice warn" }, "The active profile id \"" + cfg.activeProfile + "\" is not among the stored profiles."));
-    } else {
-      prof.append(h("div", null,
-        h("h4", { style: "margin:0 0 4px" }, p.name, " ", h("span", { class: "tag info" }, p.id)),
-        h("div", { class: "dim small" }, p.description || "")));
-      const t = h("table", { class: "mt" });
-      const e = p.engine || {};
-      t.append(h("tr", null, h("td", { class: "dim" }, "Requested engine flags"), h("td", { class: "mono" }, requestedFlags(p))));
-      t.append(h("tr", null, h("td", { class: "dim" }, "Include / exclude"), h("td", null, list(e.include) + " / " + list(e.exclude))));
-      t.append(h("tr", null, h("td", { class: "dim" }, "Weights"), h("td", null, weightText(e.weights))));
-      t.append(h("tr", null, h("td", { class: "dim" }, "IPv6 mode"), h("td", null, e.ipv6 || "auto")));
-      t.append(h("tr", null, h("td", { class: "dim" }, "Monitor"), h("td", null,
-        "latency budget " + (p.monitor && p.monitor.latencyBudgetMs ? p.monitor.latencyBudgetMs + " ms" : "none") +
-        " · probe latency " + (p.monitor && p.monitor.probeLinkLatency ? "on" : "off") +
-        " · prefers lower latency " + (p.monitor && p.monitor.preferLowerLatency ? "yes" : "no"))));
-      prof.append(t);
-      prof.append(h("div", { class: "small dim mt" },
-        "Profile selection changes how the engine is started (via the flags above); it cannot make one TCP connection use several links — that is the engine's per-connection scheduler."));
-      prof.append(h("div", { class: "row spread" }, h("button", { class: "btn secondary", onclick: () => showView("settings") }, "Change in Settings")));
-    }
-  }
+  const prof = cfg && cfg.profiles && cfg.profiles[cfg.activeProfile];
+  rp.append(section("Active profile",
+    "a profile is a request expressed in real engine flags; the engine's status file is the truth about what happened",
+    profileSummary(cfg, prof)));
 
-  const eng = $("#routeEngine");
-  clear(eng);
-  eng.append(engineBlock());
+  // topology
+  const topo = $("#routeTopo");
+  clear(topo);
+  topo.append(topology());
 
+  // cross-adapter observations
   const cross = $("#routeCross");
   clear(cross);
   const snap = state && state.snapshot;
-  if (!snap) cross.append(h("div", { class: "dim" }, "No snapshot yet."));
-  else {
-    const items = [].concat(
-      (snap.warnings || []).map((w) => ["warn", w]),
-      (snap.gaps || []).map((w) => ["info", w]),
-      (snap.errors || []).map((w) => ["bad", w]));
-    if (!items.length) cross.append(h("div", { class: "dim" }, "No cross-adapter observations were reported."));
-    items.forEach(([kind, text]) => cross.append(h("div", { class: "notice " + kind }, text)));
+  if (snap && ((snap.warnings || []).length || (snap.errors || []).length)) {
+    const list = h("div");
+    (snap.warnings || []).forEach((w) => list.append(h("div", { class: "notice warn small" }, w)));
+    (snap.errors || []).forEach((e) => list.append(h("div", { class: "notice bad small" }, e)));
+    cross.append(list);
+  } else {
+    cross.append(h("div", { class: "dim small" }, "No cross-adapter warnings. The last snapshot found a consistent picture across links."));
   }
 
-  const def = $("#routeDefaults");
-  clear(def);
-  if (!snap) def.append(h("div", { class: "dim" }, "No snapshot yet."));
-  else {
-    const t = h("table", null, h("thead", null, h("tr", null, ["Adapter", "Destination", "Gateway", "Metric", "Interface index"].map((c) => h("th", null, c)))));
-    const b = h("tbody");
-    let any = false;
-    snap.adapters.forEach((a) => (a.defaultRoutes || []).forEach((r) => {
-      any = true;
-      b.append(h("tr", null, h("td", null, a.name), h("td", null, r.destination), h("td", null, r.gateway || "on-link"), h("td", null, ival(r.metric)), h("td", null, r.index)));
-    }));
-    t.append(b);
-    def.append(any ? t : h("div", { class: "dim" }, "No default routes were attributed to an adapter."));
+  // default routes (compact) + full table (expandable)
+  const rd = $("#routeDefaults");
+  clear(rd);
+  rd.append(defaultRouteTable(snap));
+  const rf = $("#routeFull");
+  clear(rf);
+  rf.append(fullRouteTable(snap));
+}
+
+function profileSummary(cfg, prof) {
+  const wrap = h("div");
+  if (!cfg || !cfg.profiles) { wrap.append(h("div", { class: "dim" }, "No profiles are loaded.")); return wrap; }
+  const activeName = cfg.activeProfile;
+  wrap.append(h("div", { class: "row between" },
+    h("div", null, "Selected: ", h("strong", null, activeName || "(none)")),
+    h("span", { class: "tag info" }, "selection does not change the running engine")));
+  if (prof) {
+    if (prof.description) wrap.append(h("div", { class: "small dim mt" }, prof.description));
+    wrap.append(h("div", { class: "small mt" }, "Requested engine flags: ", h("span", { class: "mono" }, requestedFlags(prof))));
   }
+  const st = state && state.engine;
+  wrap.append(h("div", { class: "small dim mt" }, st
+    ? "The engine is currently running with mode " + (st.mode || UNKNOWN) + " and IPv6 " + (st.v6 || UNKNOWN) + "."
+    : "The engine is not running, so no profile's flags are in effect right now."));
+  wrap.append(h("div", { class: "small faint mt" }, "Selecting or editing a profile changes only what the engine would be asked for next time it starts. It never restarts or reconfigures a running engine on its own."));
+  return wrap;
 }
 
 function requestedFlags(p) {
-  const e = p.engine || {};
-  const parts = [];
-  if (e.include && e.include.length) parts.push("-include " + e.include.join(","));
-  if (e.exclude && e.exclude.length) parts.push("(avoid: " + e.exclude.join(",") + ")");
-  Object.keys(e.weights || {}).sort().forEach((k) => parts.push("-weight " + k + "=" + e.weights[k]));
-  if (e.autoWeight === false) parts.push("-auto-weight=false");
-  if (e.ipv6 && e.ipv6 !== "auto") parts.push("-ipv6 " + e.ipv6);
-  if (e.mtu) parts.push("-mtu " + e.mtu);
-  return parts.length ? parts.join(" ") : "engine defaults";
-}
-function weightText(w) {
-  if (!w || !Object.keys(w).length) return "— automatic (weighted by measured throughput)";
-  return Object.keys(w).sort().map((k) => k + "=" + w[k]).join(", ");
+  if (!p || !p.engine) return "(no engine overrides)";
+  const e = p.engine;
+  const bits = [];
+  if (e.include && e.include.length) bits.push("--include=" + e.include.join(","));
+  if (e.exclude && e.exclude.length) bits.push("--exclude=" + e.exclude.join(","));
+  if (e.ipv6 && e.ipv6 !== "auto") bits.push("--ipv6=" + e.ipv6);
+  if (e.mtu) bits.push("--mtu=" + e.mtu);
+  if (e.autoWeight === false) bits.push("--no-auto-weight");
+  return bits.length ? bits.join(" ") : "(defaults)";
 }
 
-/* ---------- TTL ---------- */
+function topology() {
+  const snap = state && state.snapshot;
+  const adapters = ((snap && snap.adapters) || []).filter((a) => !a.exclusionCode);
+  const on = state && state.engineOn;
+  const wrap = h("div", { class: "topo" });
+  const linksCol = h("div", { style: "display:flex;flex-direction:column;gap:8px" });
+  adapters.forEach((a) => {
+    const inEngine = a.engine;
+    linksCol.append(h("div", { class: "node" },
+      h("div", { class: "nlabel" }, (KIND_ICON[a.kind] || KIND_ICON.other)[0]),
+      h("div", { class: "nval" }, a.name),
+      h("div", { class: "tiny " + (inEngine ? "" : "faint"), style: inEngine ? "color:var(--ok)" : "" },
+        inEngine ? "in use · " + rateShort((a.rates || {}).inPerSec) + "↓" : (on ? "not used" : "idle"))));
+  });
+  const core = h("div", { class: "link" },
+    h("div", { style: "display:flex;flex-direction:column;gap:6px;align-items:center" },
+      adapters.map(() => h("div", { class: "wire" + (on ? " on" : "") })),
+      h("div", { class: "node core", style: "margin-top:6px" },
+        h("div", { class: "nlabel" }, "net-merge engine"),
+        h("div", { class: "nval" }, on ? "ON" : "OFF"))));
+  const out = h("div", { class: "link" }, h("div", { class: "wire" + (on ? " on" : "") }));
+  const internet = h("div", { class: "node" },
+    h("div", { class: "nlabel" }, "internet"),
+    h("div", { class: "nval" }, on ? "via bonded links" : "via default route"));
+  wrap.append(linksCol, core, out, internet);
+  if (!adapters.length) wrap.append(h("div", { class: "dim small", style: "align-self:center" }, "No eligible adapters to show."));
+  return wrap;
+}
+
+function defaultRouteTable(snap) {
+  const routes = ((snap && snap.adapters) || []).flatMap((a) =>
+    ((a.defaultRoutes || []).map((r) => Object.assign({ iface: a.name }, r))));
+  if (!routes.length) return h("div", { class: "dim small" }, "No default routes reported by the platform.");
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["Family", "Destination", "Next hop", "Interface", "Protocol", "Metric"].map((c, i) => h("th", { class: i === 5 ? "num" : "" }, c)))));
+  const body = h("tbody");
+  routes.forEach((r) => body.append(h("tr", null,
+    h("td", null, r.family || "—"), h("td", { class: "mono small" }, r.destination || "—"),
+    h("td", { class: "mono small" }, r.nextHop || "(on-link)"), h("td", null, r.iface || r.name || "—"),
+    h("td", null, r.protocol || "—"), h("td", { class: "num" }, r.metric || "—"))));
+  t.append(body);
+  return t;
+}
+
+function fullRouteTable(snap) {
+  const routes = (snap && snap.routes) || [];
+  if (!routes.length) return h("div", { class: "dim small" }, "The platform did not expose a full routing table for this snapshot.");
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["Family", "Destination", "Next hop", "Interface", "Protocol", "Metric"].map((c, i) => h("th", { class: i === 5 ? "num" : "" }, c)))));
+  const body = h("tbody");
+  routes.forEach((r) => body.append(h("tr", null,
+    h("td", null, r.family || "—"), h("td", { class: "mono small" }, r.destination || "—"),
+    h("td", { class: "mono small" }, r.nextHop || "(on-link)"), h("td", null, r.interfaceName || "—"),
+    h("td", null, r.protocol || "—"), h("td", { class: "num" }, r.metric || "—"))));
+  t.append(body);
+  return t;
+}
+
+/* ---------- TTL / hop limit ---------- */
+
+const TTL_PRESETS = [
+  { key: "64", label: "64", note: "Common desktop default. Neutral — matches what most OSes ship." },
+  { key: "65", label: "65", note: "Sits just above the usual 64 to survive one extra hop while staying unremarkable." },
+  { key: "128", label: "128", note: "Windows default. Higher headroom; still a normal value." },
+  { key: "255", label: "255", note: "Maximum. Some carriers/networks treat unusually high values differently — use knowingly." },
+];
+// The staged targets are keyed by the same "ipv4"/"ipv6" identifiers the control cards use.
+// A mismatch here is silent in the worst way: the value looks staged but the preview/apply
+// buttons never enable.
+let ttlStaged = { ipv4: null, ipv6: null };
 
 async function loadTTL(btn) {
   await guard(async () => {
     const d = await api("/api/ttl");
-    ttlReport = d;
+    ttlReport = d.report || d;
+    ttlStaged = { ipv4: null, ipv6: null };
     renderTTL();
-    const hist = await api("/api/ttl/history?limit=100");
-    renderTTLHistory(hist.events || []);
+    renderTTLHistory([]);
+    loadTTLHistory();
   }, btn);
-  if (!ttlReport) {
-    const s = $("#ttlState");
-    clear(s);
-    s.textContent = "TTL values could not be loaded.";
-  }
+}
+
+async function loadTTLHistory() {
+  try {
+    const d = await api("/api/ttl/history");
+    renderTTLHistory(d.events || []);
+  } catch (e) { /* history is optional */ }
 }
 
 function renderTTL() {
-  const s = $("#ttlState");
-  clear(s);
   const body = $("#ttlBody");
+  const st = $("#ttlState");
   clear(body);
-  if (!ttlReport) return;
-  const rep = ttlReport.report;
-  s.textContent = "read at " + stamp(rep.at) + " · " + (ttlReport.elevated ? "elevated" : "not elevated");
+  if (!ttlReport) { body.append(emptyState("⏱", "Loading current TTL / hop-limit values…")); return; }
 
-  const cap = rep.capabilities || {};
-  if (!cap.supported) {
-    body.append(h("div", { class: "notice info" },
-      h("strong", null, "This host has no supported mechanism for these values. "),
-      (cap.notes || []).join(" ")));
-  } else {
-    if (!ttlReport.elevated) {
-      body.append(h("div", { class: "notice warn" },
-        "This process is not elevated: values can be inspected, and writes that need administrator rights will be refused by the platform rather than silently failing."));
-    }
-    (cap.notes || []).forEach((n) => body.append(h("div", { class: "notice info" }, n)));
+  const rep = ttlReport;
+  if (st) {
+    const caps = rep.capabilities || {};
+    st.textContent = caps.platform ? (caps.platform + " · " + (caps.supported ? "changes supported here" : "read-only: no supported write mechanism on this host")) : "";
   }
 
-  const t = h("table", null, h("thead", null, h("tr", null, ["Setting", "Concept", "Family", "Scope", "Interface", "Current value", "Read from", "Writable"].map((c) => h("th", null, c)))));
-  const tb = h("tbody");
-  (rep.settings || []).forEach((x) => tb.append(h("tr", null,
-    h("td", { class: "mono" }, x.id),
-    h("td", null, x.kind || ""),
-    h("td", null, x.family || ""),
-    h("td", null, x.scope || ""),
-    h("td", null, x.interface || "—"),
-    h("td", { class: "num" }, x.value === null || x.value === undefined
-      ? h("span", { class: "dim" }, "not configured (the platform default applies)")
-      : String(x.value)),
-    h("td", null, x.valueOrigin || "—"),
-    h("td", null, x.writable ? h("span", { class: "tag ok" }, "yes") : h("span", { class: "tag warn" }, x.writableReason || "no")))));
-  t.append(tb);
-  if (!(rep.settings || []).length) body.append(h("div", { class: "dim" }, "No packet-header settings were reported."));
-  else body.append(h("div", { class: "panel" }, h("h3", null, "Packet-header settings", h("span", { class: "hint" }, "IPv4 TTL and IPv6 hop limit")), t));
-
-  const cap2 = rep.captured || {};
-  const keys = Object.keys(cap2);
-  const cp = h("div", { class: "panel" }, h("h3", null, "Captured originals", h("span", { class: "hint" }, "what Restore puts back")));
-  if (!keys.length) cp.append(h("div", { class: "notice info" }, "Nothing has been captured yet, so there is nothing to restore. A capture happens automatically before the first change to a setting."));
-  else {
-    const t2 = h("table", null, h("thead", null, h("tr", null, ["Setting", "Original value", "Explicit", "Captured at", "Read from"].map((c) => h("th", null, c)))));
-    const b2 = h("tbody");
-    keys.forEach((k) => {
-      const o = cap2[k];
-      b2.append(h("tr", null, h("td", { class: "mono" }, k),
-        h("td", { class: "num" }, o.value === null || o.value === undefined ? "— (was not set)" : o.value),
-        h("td", null, o.explicit ? "yes" : "no (platform default was in effect)"),
-        h("td", null, stamp(o.capturedAt)), h("td", null, o.origin || "—")));
-    });
-    t2.append(b2);
-    cp.append(t2);
-  }
-  body.append(cp);
-
-  if (rep.notSettings && rep.notSettings.length) {
-    const ns = h("div", { class: "panel" }, h("h3", null, "Related but different concepts", h("span", { class: "hint" }, "reported so they are not confused with the settings above")));
-    const t3 = h("table", null, h("thead", null, h("tr", null, ["Concept", "Why it is not a packet-header setting"].map((c) => h("th", null, c)))));
-    const b3 = h("tbody");
-    rep.notSettings.forEach((x) => b3.append(h("tr", null, h("td", { class: "mono" }, x.id + " (" + (x.kind || "") + ")"), h("td", null, x.writableReason || "not a packet-header value"))));
-    t3.append(b3);
-    ns.append(t3);
-    body.append(ns);
-  }
-
-  if (rep.readErrors && rep.readErrors.length) {
-    const re = h("div", { class: "panel" }, h("h3", null, "Could not be read"));
-    rep.readErrors.forEach((e) => re.append(h("div", { class: "notice warn" }, h("strong", null, e.code + " — " + (e.setting && e.setting.id ? e.setting.id : "")), " ", e.message)));
-    body.append(re);
-  }
   if (rep.warnings && rep.warnings.length) {
-    const w = h("div", { class: "panel" }, h("h3", null, "Warnings"));
-    rep.warnings.forEach((x) => w.append(h("div", { class: "notice warn" }, x)));
-    body.append(w);
+    rep.warnings.forEach((w) => body.append(h("div", { class: "notice warn" }, w)));
+  }
+  if (!rep.capabilities || !rep.capabilities.supported) {
+    body.append(h("div", { class: "notice info" }, "This host exposes no supported mechanism for writing packet TTL / hop limit, so values are shown read-only.",
+      rep.capabilities && rep.capabilities.notes ? h("ul", null, rep.capabilities.notes.map((n) => h("li", null, n))) : null));
+  }
+
+  // elevation banner
+  body.append(h("div", { class: "notice " + (rep.elevated ? "ok" : "info") }, rep.elevationNote ||
+    (rep.elevated ? "This process is elevated, so it can change system settings." : "This process is not elevated. Inspection works without it; a change will request elevation when you confirm it.")));
+
+  // ---- header controls ----
+  const header = h("div", { class: "panel" });
+  header.append(h("h3", null, "Apply a change", h("span", { class: "hint" }, "preview with a dry run first; nothing is written without confirmation")));
+  const caps = rep.capabilities || {};
+
+  // v4 card
+  const v4sys = (rep.settings || []).find((s) => s.family === "ipv4" && s.scope === "system-global");
+  const v6sys = (rep.settings || []).find((s) => s.family === "ipv6" && s.scope === "system-global");
+  header.append(ttlControlCard("IPv4 TTL", "ipv4", v4sys, caps));
+  header.append(ttlControlCard("IPv6 hop limit", "ipv6", v6sys, caps));
+
+  // preview / confirm / restore actions
+  const actions = h("div", { class: "row spread mt" });
+  const stagedAny = ttlStaged.ipv4 !== null || ttlStaged.ipv6 !== null;
+  actions.append(
+    h("div", { class: "small dim" }, stagedAny ? "You have unsaved, unapplied target values." : "No change staged. Pick a preset or type a custom value above."),
+    h("div", { class: "row tight" },
+      h("button", { class: "btn", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, true) }, "Preview (dry run)"),
+      h("button", { class: "btn primary", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, false) }, "Apply change"),
+      h("button", { class: "btn secondary", onclick: (e) => ttlRestore(e.target, false) }, "Restore captured originals")));
+  header.append(actions);
+  body.append(header);
+
+  // ---- read-back: per-interface + non-settings ----
+  const perIface = (rep.settings || []).filter((s) => s.scope === "per-interface");
+  if (perIface.length) {
+    body.append(section("Per-interface values", "these override the system-global value for packets leaving on that adapter", perIfaceTable(perIface)));
+  }
+  const notSettings = rep.notSettings || [];
+  if (notSettings.length) {
+    body.append(section("Not host-level settings", "shown so they are never confused with the packet-header values above", notSettingsTable(notSettings)));
+  }
+  if (rep.readErrors && rep.readErrors.length) {
+    const el = h("div", { class: "panel" }, h("h3", null, "Read errors"));
+    rep.readErrors.forEach((f) => el.append(h("div", { class: "notice bad small" },
+      h("strong", null, f.setting && f.setting.id ? f.setting.id : "setting"), ": ", f.message,
+      f.details && f.details.length ? h("ul", null, f.details.map((d) => h("li", null, d))) : null)));
+    body.append(el);
   }
 
   renderTTLConfig(rep.config);
-  renderTTLActions(rep);
+}
+
+function ttlControlCard(title, key, setting, caps) {
+  const card = h("div", { class: "ttl-card", style: "margin-top:12px" });
+  const supported = caps && caps.supported && setting && setting.writable;
+  const cur = setting ? setting.value : null;
+  const origin = setting ? setting.valueOrigin : null;
+  const staged = ttlStaged[key];
+
+  card.append(h("div", { class: "tt" },
+    h("div", { class: "tname" }, title, " ", h("span", { class: "scope-badge system" }, "system-wide")),
+    setting && !setting.writable && setting.writableReason ? badge("read-only", "warn") : null));
+
+  const vals = h("div", { class: "ttl-vals" });
+  vals.append(
+    h("div", null, h("div", { class: "lbl" }, "current"), h("div", { class: "cur" + (cur === null ? " def" : "") }, cur === null ? "default" : String(cur))),
+    h("div", null, h("div", { class: "lbl" }, "target"), h("div", { class: "cur" + (staged === null ? " def" : ""), style: staged !== null ? "color:var(--accent2)" : "" }, staged === null ? "—" : String(staged))),
+  );
+  if (staged !== null && staged !== cur) {
+    vals.append(h("div", { class: "ttl-diff" }, h("span", { class: "from" }, cur === null ? "default" : String(cur)),
+      h("span", { class: "arrow" }, "→"), h("span", { class: "to" }, String(staged))));
+  }
+  card.append(vals);
+  card.append(h("div", { class: "tiny faint" }, origin ? ("source: " + origin) : (cur === null ? "not explicitly configured — the OS built-in default is in use" : "")));
+
+  // presets + custom
+  const presetRow = h("div", { class: "preset-row" });
+  TTL_PRESETS.forEach((p) => {
+    const on = String(staged) === p.key || (staged === null && String(cur) === p.key);
+    presetRow.append(h("button", { class: "preset" + (on ? " active" : ""), title: p.note, onclick: () => { ttlStaged[key] = Number(p.key); renderTTL(); } }, p.label));
+  });
+  const custom = h("input", { type: "number", min: 1, max: 255, value: staged !== null ? staged : "", placeholder: "custom", style: "width:80px", onchange: (e) => { const n = Number(e.target.value); ttlStaged[key] = isFinite(n) && n >= 1 && n <= 255 ? n : null; renderTTL(); } });
+  presetRow.append(h("span", { class: "tiny faint", style: "align-self:center" }, "or"), custom, h("span", { class: "tiny faint", style: "align-self:center" }, "1–255"));
+  card.append(presetRow);
+
+  if (!supported) {
+    card.append(h("div", { class: "tiny", style: "color:var(--warn);margin-top:8px" },
+      setting && setting.writableReason ? setting.writableReason : "This value cannot be changed on this host."));
+  }
+  return card;
+}
+
+function perIfaceTable(rows) {
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["Interface", "Family", "Current", "Source", "Writable"].map((c) => h("th", null, c)))));
+  const body = h("tbody");
+  rows.forEach((s) => body.append(h("tr", null,
+    h("td", null, s.interface || "—"), h("td", null, s.family || "—"),
+    h("td", { class: "num" }, s.value === null || s.value === undefined ? h("span", { class: "dim" }, "default") : String(s.value)),
+    h("td", { class: "small dim" }, s.valueOrigin || "—"),
+    h("td", null, s.writable ? badge("yes", "ok") : badge("no", "warn")))));
+  t.append(body);
+  return t;
+}
+
+function notSettingsTable(rows) {
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["Kind", "Family", "Scope", "Why it is here"].map((c) => h("th", null, c)))));
+  const body = h("tbody");
+  rows.forEach((s) => body.append(h("tr", null,
+    h("td", null, s.kind || "—"), h("td", null, s.family || "—"),
+    h("td", null, h("span", { class: "scope-badge per" }, s.scope || "—")),
+    h("td", { class: "small dim" }, s.writableReason || "shown for completeness"))));
+  t.append(body);
+  return t;
+}
+
+async function ttlApply(btn, dry) {
+  // The preview must describe the values the user staged on screen, not whatever was last
+  // saved to the config file. Staged values ride along as an override that lives for this
+  // one operation, so the manager reports the real from/to for exactly what they chose.
+  const cfg = buildTTLOverride();
+  const body = { dryRun: dry, confirm: !dry, config: cfg };
+  const preview = await guard(() => api("/api/ttl/apply", { method: "POST", body }), btn);
+  if (!preview) return;
+  if (dry) { renderOutcomeModal("Dry-run preview", preview, true, () => ttlApply(btn, false)); return; }
+  // a real apply: reload and show read-back
+  await loadTTL();
+  renderOutcomeModal("Applied", preview, false);
+}
+
+// buildTTLOverride returns the config this operation should act on: the stored configuration
+// with the staged values substituted in. A family with no staged value keeps the stored target,
+// so applying after staging only one family does not silently reset the other.
+function buildTTLOverride() {
+  const base = (ttlReport && ttlReport.config) || {};
+  const cfg = Object.assign({}, base);
+  // Fill in anything the stored config is missing. An unsaved configuration arrives as an
+  // empty object and Validate() rejects that outright, so the scaffolding around the staged
+  // values must never be the reason this operation fails.
+  cfg.schema = cfg.schema || "netmerge-ttl/1";
+  cfg.version = cfg.version || 1;
+  cfg.enabled = true;
+  if (ttlStaged.ipv4 !== null) cfg.bumpIPv4 = ttlStaged.ipv4;
+  if (ttlStaged.ipv6 !== null) cfg.bumpIPv6 = ttlStaged.ipv6;
+  if (cfg.bumpIPv4 == null || cfg.bumpIPv4 < 1 || cfg.bumpIPv4 > 255) cfg.bumpIPv4 = 64;
+  if (cfg.bumpIPv6 == null || cfg.bumpIPv6 < 1 || cfg.bumpIPv6 > 255) cfg.bumpIPv6 = 64;
+  if (!cfg.interfacePolicy || (cfg.interfacePolicy === "list" && !(cfg.includeIfaces || []).length)) {
+    cfg.interfacePolicy = "none";
+  }
+  return cfg;
+}
+
+async function ttlRestore(btn, dry) {
+  const out = await guard(() => api("/api/ttl/restore", { method: "POST", body: { dryRun: false, confirm: true } }), btn);
+  if (!out) return;
+  await loadTTL();
+  renderOutcomeModal("Restore", out, false);
+}
+
+function renderOutcomeModal(title, out, dry, onConfirm) {
+  const body = h("div");
+  body.append(h("div", { class: "small dim" }, (out.applied || 0) + " applied, " + (out.failed || 0) + " failed" + (out.dryRun ? " (nothing was written)" : "")));
+  if (out.changes && out.changes.length) {
+    const t = h("table", { class: "compact", style: "margin-top:8px" },
+      h("thead", null, h("tr", null, ["Setting", "From", "To", "Result"].map((c, i) => h("th", { class: i === 1 || i === 2 ? "num" : "" }, c)))));
+    const tb = h("tbody");
+    out.changes.forEach((c) => {
+      const r = c.outcome;
+      tb.append(h("tr", null,
+        h("td", { class: "small mono" }, c.setting && c.setting.id ? c.setting.id : "—"),
+        h("td", { class: "num" }, c.from === null || c.from === undefined ? h("span", { class: "dim" }, "—") : String(c.from)),
+        h("td", { class: "num" }, String(c.to)),
+        h("td", null, outcomeTag(r, c.verified), c.detail ? h("div", { class: "tiny dim" }, c.detail) : null)));
+    });
+    t.append(tb);
+    body.append(t);
+  }
+  if (out.notes && out.notes.length) out.notes.forEach((n) => body.append(h("div", { class: "notice info small mt" }, n)));
+  if (out.rollbackIncomplete) {
+    body.append(h("div", { class: "notice bad" }, h("strong", null, "Rollback was incomplete."),
+      out.rollbackDetail && out.rollbackDetail.length ? h("ul", null, out.rollbackDetail.map((d) => h("li", null, d))) : h("div", { class: "small" }, "Some values could not be returned to their originals. Inspect the per-interface table and restore manually if needed.")));
+  } else if (out.rolledBack) {
+    body.append(h("div", { class: "notice warn" }, "A failure occurred and the change was rolled back — no partial state was left in place."));
+  }
+
+  const back = h("div", { class: "modal-back" });
+  const close = () => back.remove();
+  const foot = h("div", { class: "mfoot" }, h("button", { class: "btn secondary", onclick: close }, "Close"));
+  if (dry && onConfirm) {
+    foot.append(h("button", { class: "btn primary", onclick: () => { close(); onConfirm(); } }, "Confirm & apply"));
+  }
+  back.append(h("div", { class: "modal" }, h("div", { class: "mhead" }, h("h3", null, title + (dry ? " (dry run)" : ""))), h("div", { class: "mbody" }, body), foot));
+  back.addEventListener("click", (e) => { if (e.target === back) close(); });
+  document.body.append(back);
+}
+
+function outcomeTag(r, verified) {
+  if (r === "applied") return verified ? badge("applied · verified", "ok") : badge("applied · unverified", "warn");
+  if (r === "unchanged") return badge("unchanged", "skip");
+  if (r === "failed") return badge("failed", "bad");
+  if (r === "rolled-back") return badge("rolled-back", "warn");
+  if (r === "rollback-incomplete") return badge("rollback incomplete", "bad");
+  if (r === "dry-run") return badge("dry-run", "info");
+  return badge(r || UNKNOWN, "skip");
 }
 
 function renderTTLConfig(cfg) {
-  const box = $("#ttlConfig");
-  clear(box);
-  const c = Object.assign({}, cfg); // keep unknown fields when saving back
-  const fields = {};
-
-  const chk = (name, label) => {
-    const i = h("input", { type: "checkbox", checked: !!c[name], onchange: () => { c[name] = i.checked; } });
-    fields[name] = i;
-    return h("label", { class: "field" }, h("span", null, label), i);
-  };
-  const num = (name, label) => {
-    const i = h("input", { type: "number", value: c[name] ?? 0, onchange: () => { c[name] = Number(i.value); } });
-    fields[name] = i;
-    return h("label", { class: "field" }, h("span", null, label), i);
-  };
-  const text = (name, label) => {
-    const i = h("input", { type: "text", value: (c[name] || []).join(", "), onchange: () => { c[name] = i.value.split(",").map((s) => s.trim()).filter(Boolean); } });
-    fields[name] = i;
-    return h("label", { class: "field" }, h("span", null, label), i);
-  };
-  const pol = h("select", null,
-    ["none", "list", "all-except"].map((p) => h("option", p === c.interfacePolicy ? { selected: true } : {}, p)));
-  pol.addEventListener("change", () => { c.interfacePolicy = pol.value; });
-
-  box.append(h("div", { class: "grid2" },
-    chk("enabled", "Management enabled (records intent only; never acted on by itself)"),
-    num("bumpIPv4", "IPv4 TTL to write"),
-    num("bumpIPv6", "IPv6 hop limit to write"),
-    h("label", { class: "field" }, h("span", null, "Per-interface policy"), pol),
-    text("includeIfaces", "Include adapters (list policy)"),
-    text("excludeIfaces", "Exclude adapters (all-except policy)")));
-  box.append(h("div", { class: "small dim mt" },
-    "The per-interface mechanism is Windows' " , h("code", null, "Set-NetIPInterface -CurrentHopLimit"), ". Whether it can be applied is verified by reading the value back after each write; a write that cannot be confirmed is reported as unverified, never as success."));
-  box.append(h("div", { class: "row spread" },
-    h("button", { class: "btn", onclick: (e) => guard(async () => {
-      await api("/api/ttl/config", { method: "POST", body: c });
-      toast("ok", "TTL configuration saved. Nothing was changed on the system.");
-      loadTTL();
-    }, e.target) }, "Save configuration")));
-}
-
-function renderTTLActions(rep) {
-  const body = $("#ttlBody");
-  const box = h("div", { class: "panel" }, h("h3", null, "Preview, apply, restore", h("span", { class: "hint" }, "preview first; a real change always asks for confirmation")));
-  const out = h("div", { class: "mt" });
-  const preview = (restore, btn) => guard(async () => {
-    const d = await api(restore ? "/api/ttl/restore" : "/api/ttl/apply", { method: "POST", body: { dryRun: true, reason: "dashboard preview" } });
-    renderOutcome(out, d, true);
-  }, btn);
-  const real = (restore, btn) => {
-    const what = restore
-      ? "Restore the captured original TTL/hop-limit values? This writes to system settings."
-      : "Apply the configured TTL/hop-limit changes now? This writes to system settings.";
-    if (!confirm(what + "\n\nPreview first if you have not, so you know exactly what will change.")) return;
-    return guard(async () => {
-      const d = await api(restore ? "/api/ttl/restore" : "/api/ttl/apply", { method: "POST", body: { dryRun: false, confirm: true, reason: "confirmed in dashboard" } });
-      renderOutcome(out, d, false);
-      toast(d.failed ? "warn" : "ok", restore ? "Restore finished." : "Apply finished.", d.failed ? d.failed + " change(s) failed" : undefined);
-      loadTTL();
-    }, btn);
-  };
-  box.append(h("div", { class: "row" },
-    h("button", { class: "btn secondary", onclick: (e) => preview(false, e.target) }, "Preview planned changes"),
-    h("button", { class: "btn", onclick: (e) => real(false, e.target) }, "Apply changes…"),
-    h("button", { class: "btn secondary", onclick: (e) => preview(true, e.target) }, "Preview restore"),
-    h("button", { class: "btn danger", onclick: (e) => real(true, e.target) }, "Restore originals…")));
-  box.append(out);
-  body.append(box);
-}
-
-function renderOutcome(container, d, dry) {
-  clear(container);
-  const kind = d.rollbackIncomplete ? "bad" : d.failed ? "warn" : "ok";
-  const head = dry ? "Preview (nothing was written)" : "Result";
-  container.append(h("div", { class: "notice " + kind },
-    h("strong", null, head + ": "),
-    d.applied + " change(s) " + (dry ? "planned" : "applied") + ", " + d.failed + " failed",
-    d.rolledBack ? " · rolled back completely" : "",
-    d.rollbackIncomplete ? " · ROLLBACK INCOMPLETE" : ""));
-  (d.rollbackDetail || []).forEach((x) => container.append(h("div", { class: "notice bad" }, x)));
-  (d.notes || []).forEach((x) => container.append(h("div", { class: "notice info" }, x)));
-  if (d.changes && d.changes.length) {
-    const t = h("table", null, h("thead", null, h("tr", null, ["Setting", "From", "To", "Outcome", "Verified"].map((c) => h("th", null, c)))));
-    const b = h("tbody");
-    d.changes.forEach((ch) => b.append(h("tr", null,
-      h("td", { class: "mono" }, ch.setting.id),
-      h("td", { class: "num" }, ch.from === null || ch.from === undefined ? "— (unread)" : ch.from),
-      h("td", { class: "num" }, ch.to),
-      h("td", null, h("span", { class: "tag " + (ch.outcome === "applied" || ch.outcome === "planned" ? "ok" : "warn") }, ch.outcome)),
-      h("td", null, ch.verified ? h("span", { class: "tag ok" }, "read back") : h("span", { class: "tag warn" }, "not confirmed")))));
-    t.append(b);
-    container.append(t);
-  }
+  const el = $("#ttlConfig");
+  clear(el);
+  if (!cfg) { el.append(h("div", { class: "dim small" }, "No stored configuration.")); return; }
+  el.append(h("div", { class: "small", style: "margin-bottom:10px" },
+    "This configuration records what you would <em>like</em> written. It is saved here and never applied by itself — a change only happens when you explicitly confirm one on this page.",
+    cfg.enabled ? null : h("span", { class: "tag warn", style: "margin-left:8px" }, "management is off")));
+  el.append(kvList([
+    ["Opted in to management", cfg.enabled ? "yes" : "no"],
+    ["IPv4 target", String(cfg.bumpIPv4)],
+    ["IPv6 target", String(cfg.bumpIPv6)],
+    ["Per-interface policy", cfg.interfacePolicy || "—"],
+    ["Include interfaces", cfg.includeIfaces && cfg.includeIfaces.length ? cfg.includeIfaces.join(", ") : "(all)"],
+    ["Exclude interfaces", cfg.excludeIfaces && cfg.excludeIfaces.length ? cfg.excludeIfaces.join(", ") : "(none)"],
+    ["Last saved", stamp(cfg.updated)],
+  ]));
 }
 
 function renderTTLHistory(events) {
-  const box = $("#ttlHistory");
-  clear(box);
-  if (!events.length) { box.append(h("div", { class: "dim" }, "No changes have been recorded.")); return; }
-  const t = h("table", null, h("thead", null, h("tr", null, ["When", "Setting", "From", "To", "Outcome", "Reason", "Error"].map((c) => h("th", null, c)))));
-  const b = h("tbody");
-  events.forEach((e) => b.append(h("tr", null,
-    h("td", null, stamp(e.at)),
-    h("td", { class: "mono" }, e.id + (e.interface ? " @ " + e.interface : "")),
-    h("td", { class: "num" }, e.old === null || e.old === undefined ? "—" : e.old),
-    h("td", { class: "num" }, e.new === null || e.new === undefined ? "—" : e.new),
-    h("td", null, h("span", { class: "tag " + (e.outcome === "applied" || e.outcome === "restored" ? "ok" : "warn") }, e.outcome)),
-    h("td", null, e.reason || ""),
-    h("td", null, e.error || ""))));
-  t.append(b);
-  box.append(t);
+  const el = $("#ttlHistory");
+  clear(el);
+  if (!events || !events.length) { el.append(h("div", { class: "dim small" }, "No TTL/hop-limit changes have been attempted yet.")); return; }
+  const t = h("table", { class: "compact" },
+    h("thead", null, h("tr", null, ["When", "Setting", "Old", "New", "Result", "Reason"].map((c, i) => h("th", { class: i === 2 || i === 3 ? "num" : "" }, c)))));
+  const tb = h("tbody");
+  events.forEach((e) => tb.append(h("tr", null,
+    h("td", { class: "small" }, stamp(e.at)),
+    h("td", { class: "small mono" }, e.interface ? (e.family + " per-iface " + e.interface) : e.id),
+    h("td", { class: "num" }, e.old === null || e.old === undefined ? h("span", { class: "dim" }, "—") : String(e.old)),
+    h("td", { class: "num" }, e.new === null || e.new === undefined ? h("span", { class: "dim" }, "—") : String(e.new)),
+    h("td", null, outcomeTag(e.outcome), e.error ? h("div", { class: "tiny", style: "color:var(--bad)" }, e.error) : null),
+    h("td", { class: "small dim" }, e.reason || "—"))));
+  t.append(tb);
+  el.append(t);
 }
 
 /* ---------- diagnostics ---------- */
 
-let checkMetas = null;
+let diagChecks = null;   // { checks, categories, disabledChecks }
+let diagSelected = new Set();
 
 async function ensureChecks() {
-  if (checkMetas) return;
-  await guard(async () => {
-    const d = await api("/api/diag/checks");
-    checkMetas = d;
+  if (diagChecks) return;
+  try {
+    diagChecks = await api("/api/diag/checks");
     renderChecks();
-  });
+  } catch (e) { /* registry unavailable; the run buttons explain why */ }
 }
 
 function renderChecks() {
-  const box = $("#diagChecks");
-  clear(box);
-  if (!checkMetas) return;
-  const disabled = new Set(checkMetas.disabledChecks || []);
-  const t = h("table", null, h("thead", null, h("tr", null, ["", "Check", "Category", "What it establishes"].map((c) => h("th", null, c)))));
-  const b = h("tbody");
-  (checkMetas.checks || []).forEach((m) => {
-    const cb = h("input", { type: "checkbox", "data-id": m.id, checked: !disabled.has(m.id) });
-    if (disabled.has(m.id)) cb.disabled = true;
-    b.append(h("tr", null,
-      h("td", null, cb),
-      h("td", null, h("strong", null, m.id), h("div", { class: "small dim" }, m.title)),
-      h("td", null, h("span", { class: "tag info" }, m.category)),
-      h("td", null,
-        h("div", { class: "small" }, m.purpose || ""),
-        h("details", { class: "mt" }, h("summary", null, "establishes / does not establish"),
-          h("div", { class: "small mt" }, h("strong", null, "Establishes:")),
-          h("ul", { class: "small est" }, (m.establishes || []).map((x) => h("li", null, x))),
-          h("div", { class: "small mt" }, h("strong", null, "Does not establish:")),
-          h("ul", { class: "small est" }, (m.doesNotEstablish || []).map((x) => h("li", null, x)))))));
+  const el = $("#diagChecks");
+  clear(el);
+  if (!diagChecks) { el.append(h("div", { class: "dim small" }, "The diagnostics registry is not available in this environment.")); return; }
+  const disabled = new Set(diagChecks.disabledChecks || []);
+  const grid = h("div", { class: "grid2" });
+  (diagChecks.checks || []).forEach((c) => {
+    const off = disabled.has(c.id);
+    const box = h("input", { type: "checkbox", checked: !off && diagSelected.has(c.id), onchange: (e) => { if (e.target.checked) diagSelected.add(c.id); else diagSelected.delete(c.id); } });
+    grid.append(h("label", { class: "inline", style: "align-items:flex-start;flex-direction:column;gap:4px" },
+      h("div", { class: "row tight" }, box, h("strong", null, c.title),
+        c.category ? badge(c.category, "skip") : null,
+        c.needsAdmin ? badge("needs admin", "warn") : null,
+        c.slow ? badge("slow", "skip") : null,
+        off ? badge("disabled", "skip") : null),
+      c.purpose ? h("div", { class: "help" }, c.purpose) : null,
+      (c.establishes && c.establishes.length) ? h("div", { class: "tiny faint" }, "proves: " + c.establishes.join("; ")) : null,
+      (c.doesNotEstablish && c.doesNotEstablish.length) ? h("div", { class: "tiny", style: "color:var(--warn)" }, "does not prove: " + c.doesNotEstablish.join("; ")) : null));
   });
-  t.append(b);
-  box.append(t);
-  if (disabled.size) box.append(h("div", { class: "notice info mt" }, disabled.size + " check(s) are disabled in Settings and will be skipped."));
+  el.append(grid);
 }
 
 async function runDiag(all, btn) {
-  const ids = [];
-  document.querySelectorAll("#diagChecks input[type=checkbox]").forEach((cb) => { if (cb.checked) ids.push(cb.dataset.id); });
-  if (!all && !ids.length) { toast("warn", "No checks are selected."); return; }
-  const body = all ? { all: true } : { ids };
+  const ids = all ? [] : Array.from(diagSelected);
+  if (!all && !ids.length) { toast("warn", "Select at least one check, or use Run all."); return; }
   await guard(async () => {
-    const j = await api("/api/diag/run", { method: "POST", body });
-    diagJobId = j.id;
+    const d = await api("/api/diag/run", { method: "POST", body: { all: !!all, ids: ids } });
+    diagJobId = d.id;
     $("#diagCancel").disabled = false;
+    showProgress("diag", "Running diagnostics…");
     pollDiagJob();
   }, btn);
 }
 
-async function pollDiagJob() {
-  if (!diagJobId) return;
-  let j;
-  try { j = await api("/api/diag/runs/" + encodeURIComponent(diagJobId)); }
-  catch (e) { $("#diagProgress").textContent = "Could not read the run: " + e.message; return; }
-  const prog = $("#diagProgress");
-  clear(prog);
-  if (j.status === "running") {
-    prog.append(h("div", { class: "notice info spin" }, "Run " + j.id + " is in progress since " + clock(j.started) + ". The page stays responsive; results appear when the run finishes."));
-    setTimeout(pollDiagJob, 1200);
-    return;
-  }
-  $("#diagCancel").disabled = true;
-  if (j.status !== "done") {
-    prog.append(h("div", { class: "notice bad" }, "Run " + j.id + " ended as " + j.status + (j.error ? ": " + j.error : ".")));
-    // A stopped run keeps the checks that had finished. Show them, clearly labelled: a check with
-    // no result here did not pass, it did not run, and the two must not look alike.
-    const partial = j.diag && j.diag.result;
-    const partialResults = (partial && partial.results) || [];
-    if (partialResults.length) {
-      prog.append(h("div", { class: "notice warn" },
-        "What follows is the partial set: the " + partialResults.length + " check(s) that had already finished when the run stopped. Every other check has no result - not a pass - and can be run again."));
-      renderDiagResults(partial);
-    }
-    return;
-  }
-  lastDiag = j.diag.result;
-  prog.append(h("div", { class: "notice ok" }, lastDiag.summary + " · took " + goDur(lastDiag.duration) + " · " + lastDiag.results.length + " checks"));
-  renderDiagResults(lastDiag);
+function showProgress(kind, label) {
+  const p = $("#diagProgress");
+  p.classList.remove("hidden");
+  setAll(p, [h("div", { class: "panel" }, h("h3", null, label),
+    h("div", { class: "progress indet" }, h("span")))]);
 }
 
-function renderDiagResults(run) {
-  const box = $("#diagResults");
-  clear(box);
-  if (!run) return;
-  if (run.skipped && Object.keys(run.skipped).length) {
-    const sk = h("div", { class: "panel" }, h("h3", null, "Skipped checks"));
-    Object.entries(run.skipped).forEach(([id, why]) => sk.append(h("div", { class: "small" }, h("span", { class: "mono" }, id), " — ", why)));
-    box.append(sk);
+function hideProgress() { $("#diagProgress").classList.add("hidden"); }
+
+async function pollDiagJob() {
+  if (!diagJobId) return;
+  try {
+    const d = await api("/api/diag/runs/" + diagJobId);
+    if (d.status === "running") { showProgress("diag", d.progress || "Running diagnostics…"); setTimeout(pollDiagJob, 700); return; }
+    hideProgress();
+    $("#diagCancel").disabled = true;
+    lastDiag = d.diag || null;
+    renderDiagResults(lastDiag, d);
+  } catch (e) { hideProgress(); toast("bad", "Could not poll the diagnostics job.", e.message, e.code); }
+}
+
+async function cancelDiag(btn) {
+  if (!diagJobId) return;
+  await guard(() => api("/api/diag/cancel", { method: "POST", body: { id: diagJobId } }), btn);
+  toast("info", "Cancellation requested.");
+}
+
+function renderDiagResults(dv, job) {
+  const el = $("#diagResults");
+  clear(el);
+  if (job && job.status === "failed") { el.append(h("div", { class: "notice bad" }, job.error || "The diagnostics run failed.")); return; }
+  if (job && job.status === "cancelled") { el.append(h("div", { class: "notice warn" }, "The run was cancelled. Results below are partial.")); }
+  if (!dv || !dv.result) { el.append(emptyState("🩺", "No diagnostics run yet.", "Run all supported checks, or select specific ones and run them.")); return; }
+  const r = dv.result;
+  const panel = h("div", { class: "panel" });
+  panel.append(h("h3", null, "Results", h("span", { class: "hint" }, r.summary || "")));
+  panel.append(h("div", { class: "small dim" }, "Started " + stamp(r.started) + (r.duration ? " · took " + goDur(r.duration) : "") + (r.platform ? " · " + r.platform : "")));
+  (r.results || []).forEach((res) => panel.append(diagResultCard(res)));
+  if (r.skipped && Object.keys(r.skipped).length) {
+    const sk = h("div", { class: "notice info" }, h("strong", null, "Skipped checks"));
+    const ul = h("ul");
+    Object.entries(r.skipped).forEach(([id, reason]) => ul.append(h("li", null, h("span", { class: "mono" }, id), ": ", reason)));
+    sk.append(ul); panel.append(sk);
   }
-  (run.results || []).forEach((res) => {
-    const panel = h("div", { class: "panel" },
-      h("div", { class: "row between" },
-        h("h3", { style: "margin:0" }, res.title, " ", h("span", { class: "mono small dim" }, res.id)),
-        h("div", null, tag(res.status), " ", h("span", { class: "small dim" }, goDur(res.duration)))),
-      h("div", { class: "mt" }, res.summary || ""));
-    if (res.established && res.established.length) {
-      panel.append(h("div", { class: "small mt" }, h("strong", null, "Established:")), h("ul", { class: "small est" }, res.established.map((x) => h("li", null, x))));
-    }
-    if (res.inconclusive && res.inconclusive.length) {
-      panel.append(h("div", { class: "small mt" }, h("strong", null, "Could not establish:")), h("ul", { class: "small est" }, res.inconclusive.map((x) => h("li", null, x))));
-    }
-    if (res.errorCodes && res.errorCodes.length) {
-      const codes = h("div", { class: "mt" });
-      res.errorCodes.forEach((c) => {
-        const info = codeInfo(c);
-        codes.append(h("span", { class: "tag warn", style: "margin-right:6px", title: info ? info.meaning : c }, c));
-      });
-      panel.append(codes);
-      res.errorCodes.forEach((c) => {
-        const info = codeInfo(c);
-        if (!info) return;
-        panel.append(h("div", { class: "small", style: "margin-top:2px" },
-          h("span", { class: "mono" }, c), " — ", info.meaning,
-          info.fix ? h("span", { class: "dim" }, " " + info.fix) : null));
-      });
-    }
-    if (res.nextSteps && res.nextSteps.length) {
-      panel.append(h("div", { class: "small mt" }, h("strong", null, "Next steps:")), h("ul", { class: "small est" }, res.nextSteps.map((x) => h("li", null, x))));
-    }
-    (res.evidence || []).forEach((ev) => {
-      const det = h("details", { class: "mt" }, h("summary", null,
-        "evidence: " + ev.label + (ev.command && ev.command.length ? " — " + ev.command.join(" ") : "")));
-      let meta = [];
-      if (ev.exitCode !== null && ev.exitCode !== undefined) meta.push("exit " + ev.exitCode);
-      if (ev.timedOut) meta.push("timed out");
-      if (ev.truncated) meta.push("output truncated");
-      if (ev.err) meta.push("error: " + ev.err);
-      if (ev.note) meta.push(ev.note);
-      if (meta.length) det.append(h("div", { class: "small dim" }, meta.join(" · ")));
-      if (ev.output && ev.output.length) det.append(h("pre", null, ev.output.join("\n")));
-      panel.append(det);
-    });
-    if (res.notes && res.notes.length) panel.append(h("div", { class: "notice info mt" }, res.notes.join(" ")));
-    box.append(panel);
-  });
+  el.append(panel);
+}
+
+function diagResultCard(res) {
+  const st = res.status;
+  const tone = st === "pass" ? "ok" : st === "warn" ? "warn" : st === "fail" || st === "error" ? "bad" : "skip";
+  const body = h("div", { class: "mt" });
+  if (res.summary) body.append(h("div", null, res.summary));
+  if (res.established && res.established.length) {
+    body.append(h("div", { class: "small mt" }, h("strong", null, "This run proved:")));
+    const ul = h("ul", { class: "est" }); res.established.forEach((x) => ul.append(h("li", null, x))); body.append(ul);
+  }
+  if (res.inconclusive && res.inconclusive.length) {
+    body.append(h("div", { class: "small mt" }, h("strong", null, "Inconclusive:")));
+    const ul = h("ul"); res.inconclusive.forEach((x) => ul.append(h("li", null, x))); body.append(ul);
+  }
+  if (res.nextSteps && res.nextSteps.length) {
+    body.append(h("div", { class: "small mt" }, h("strong", null, "Supported next steps:")));
+    const ul = h("ul"); res.nextSteps.forEach((x) => ul.append(h("li", null, x))); body.append(ul);
+  }
+  if (res.measure) {
+    body.append(h("div", { class: "small mt" }, "Measure: ", h("span", { class: "mono" }, (res.measure.value != null ? res.measure.value : "—") + (res.measure.unit ? " " + res.measure.unit : ""))));
+  }
+  if (res.errorCodes && res.errorCodes.length) {
+    body.append(h("div", { class: "row tight mt" }, res.errorCodes.map((c) => badge(c, "info"))));
+  }
+  if (res.evidence && res.evidence.length) {
+    body.append(h("details", { class: "exp inline mt" }, h("summary", null, "Evidence (" + res.evidence.length + ")"),
+      h("div", { class: "exp-body" }, res.evidence.map((ev) => h("pre", null, typeof ev === "string" ? ev : (ev.output || JSON.stringify(ev)))))));
+  }
+  if (res.notes && res.notes.length) res.notes.forEach((n) => body.append(h("div", { class: "tiny faint mt" }, n)));
+  return h("div", { class: "notice " + tone + " mt", style: "border-width:1px" },
+    h("div", { class: "row between" }, h("strong", null, res.title || res.id), statusTag(st)),
+    body);
 }
 
 /* ---------- export ---------- */
 
 async function startExport(btn) {
   await guard(async () => {
-    const j = await api("/api/export", { method: "POST", body: {} });
-    exportJobId = j.id;
+    const d = await api("/api/export", { method: "POST", body: {} });
+    exportJobId = d.id;
     $("#exportPanel").classList.remove("hidden");
-    $("#exportMeta").textContent = "Export " + j.id + " is being assembled…";
+    showProgress("export", "Assembling & redacting the report…");
     pollExportJob();
   }, btn);
 }
 
 async function pollExportJob() {
   if (!exportJobId) return;
-  let j;
-  try { j = await api("/api/export/" + encodeURIComponent(exportJobId)); }
-  catch (e) { $("#exportMeta").textContent = "Could not read the export: " + e.message; return; }
-  if (j.status === "running") {
-    $("#exportMeta").textContent = "Export " + j.id + " is being assembled and redacted…";
-    setTimeout(pollExportJob, 1000);
-    return;
-  }
-  if (j.status !== "done") {
-    $("#exportMeta").textContent = "Export ended as " + j.status + (j.error ? ": " + j.error : ".");
-    return;
-  }
-  lastExport = j.export;
-  renderExport(j.export);
+  try {
+    const d = await api("/api/export/" + exportJobId);
+    if (d.status === "running") { showProgress("export", d.progress || "Assembling the report…"); setTimeout(pollExportJob, 700); return; }
+    hideProgress();
+    if (d.status === "failed") { toast("bad", d.error || "The export failed."); return; }
+    lastExport = d.export || null;
+    renderExport(lastExport);
+  } catch (e) { hideProgress(); toast("bad", "Could not poll the export job.", e.message, e.code); }
 }
 
 function renderExport(e) {
+  if (!e) return;
   const meta = $("#exportMeta");
   clear(meta);
-  const c = e.redactionCounts || {};
-  meta.append(
-    h("div", null, h("strong", null, e.baseName)),
-    h("div", { class: "small dim" },
-      "redacted: " + (c.total || 0) + " value(s) — addresses " + (c.publicAddresses || 0) +
-      ", MACs " + (c.macAddresses || 0) + ", user paths " + (c.userPaths || 0) +
-      ", serials " + (c.serials || 0) + ", credentials " + (c.credentials || 0) +
-      ", names " + (c.accountAndHostNames || 0)),
-    h("div", { class: "small dim" }, "Nothing has been uploaded. Saving writes two files into your outputs directory."));
-
+  meta.append(h("div", { class: "small" }, "Report base name: ", h("span", { class: "mono" }, e.baseName)));
+  const counts = e.redactionCounts || {};
+  const nRed = Object.values(counts).reduce((a, b) => a + (Number(b) || 0), 0);
+  meta.append(h("div", { class: "small dim" }, nRed > 0
+    ? "Redaction applied (" + nRed + " values replaced). The mapping is NOT included below."
+    : "No redaction was triggered by the current privacy settings."));
   const vis = $("#exportVisibility");
   clear(vis);
-  const entries = e.redactionEntries || [];
-  if (entries.length) {
-    vis.append(h("div", { class: "notice warn" },
-      h("strong", null, "What the placeholders stand for "),
-      "— this mapping is shown only here and is never written into the report files."));
-    const t = h("table", null, h("thead", null, h("tr", null, ["Placeholder", "Category", "Actual value"].map((x) => h("th", null, x)))));
-    const b = h("tbody");
-    entries.forEach((en) => b.append(h("tr", null, h("td", { class: "mono" }, en.placeholder), h("td", null, en.category), h("td", { class: "mono" }, en.value))));
-    t.append(b);
-    vis.append(t);
-  } else {
-    vis.append(h("div", { class: "notice ok" }, "Nothing needed redacting in this report."));
-  }
-  $("#exportText").textContent = e.text;
+  vis.append(h("div", { class: "notice info" }, h("strong", null, "Inspect before sharing. "),
+    "Nothing is uploaded — this is a local file. Review the preview below for anything you do not want to send, then save.", e.entries && e.entries.length ? h("div", { class: "small dim mt" }, "Placeholders hide real values; the key is not shown in the artifact.") : null));
+  const t = $("#exportText");
+  t.textContent = (e.text || "").slice(0, 200000);
+  $("#exportPanel").classList.remove("hidden");
 }
 
 async function saveExport(btn) {
   if (!exportJobId) return;
   await guard(async () => {
     const d = await api("/api/export/save", { method: "POST", body: { id: exportJobId } });
-    toast("ok", "Saved.", d.saved.join("\n"));
+    toast("ok", "Export saved.", (d.saved || []).join("\n"));
   }, btn);
+}
+
+function copyExport(btn) {
+  if (!lastExport) return;
+  copyText(lastExport.json || lastExport.text || "", "Export JSON copied to clipboard.");
 }
 
 /* ---------- logs ---------- */
 
-function startLogs() {
-  if (logTimer) return;
-  pollLogs();
-  logTimer = setInterval(pollLogs, 2500);
-}
+// The tail is kept in memory, not re-derivered from each response: a "since" poll that brings
+// nothing new must not blank the lines already on screen, because those lines are still the log.
+let logBuf = [];          // newest first
+let logLastKey = "";      // what level+query the buffer currently reflects
+
+function startLogs() { stopLogs(); resetLogBuf(); pollLogs(); logTimer = setInterval(pollLogs, 1500); }
 function stopLogs() { if (logTimer) { clearInterval(logTimer); logTimer = null; } }
 
+function logFilterKey() { return $("#logLevel").value + "\u0000" + $("#logQuery").value.trim(); }
+
+// The API sends level as a number (logx iota) and levelName as the text; the page only ever
+// wants the text.
+function logLevelName(e) { return e.levelName || "info"; }
+
+// Dropping the buffer means the next poll must re-read from the beginning, not from the old
+// cursor - otherwise a level change would silently keep showing the previous level's events.
+function resetLogBuf() { logBuf = []; logLastKey = logFilterKey(); logSelected.clear(); logCursor = 0; }
+
 async function pollLogs() {
+  // A changed level or search invalidates the buffer: the next poll re-reads from scratch.
+  if (logFilterKey() !== logLastKey) resetLogBuf();
+  const lvl = $("#logLevel").value;
   const q = $("#logQuery").value.trim();
-  const level = $("#logLevel").value;
+  const since = q ? 0 : logCursor;
+  const path = "/api/logs?level=" + encodeURIComponent(lvl) + "&limit=400" + (q ? "&q=" + encodeURIComponent(q) : "") + (since ? "&since=" + since : "");
   try {
-    let d;
-    if (q) d = await api("/api/logs?level=" + encodeURIComponent(level) + "&limit=400&q=" + encodeURIComponent(q));
-    else d = await api("/api/logs?level=" + encodeURIComponent(level) + "&limit=300&since=" + logCursor);
-    renderLogs(d, !!q);
-    if (!q && typeof d.cursor === "number") logCursor = d.cursor;
-  } catch (e) {
-    $("#logBody").textContent = "Could not read logs: " + e.message;
+    const d = await api(path);
+    if (d.cursor) logCursor = d.cursor;
+    const incoming = (d && d.events) || [];
+    if (incoming.length) {
+      // Responses are newest first; merging keeps that order and drops repeats by seq.
+      const seen = new Set(logBuf.map((e) => e.seq));
+      const fresh = incoming.filter((e) => !e.seq || !seen.has(e.seq));
+      logBuf = fresh.concat(logBuf).slice(0, 400);
+    } else if (since) {
+      // Nothing new since the last cursor: the lines on screen are still correct, so leave
+      // them alone rather than flashing an empty state.
+      return;
+    }
+    renderLogs();
+  } catch (e) { /* transient; keep the last good view */ }
+}
+
+function renderLogs() {
+  const body = $("#logBody");
+  const isSearch = !!$("#logQuery").value.trim();
+  const events = logBuf;
+  clear(body);
+  if (!events.length) {
+    body.append(emptyState(isSearch ? "🔍" : "≡", isSearch ? "No events match that search." : "No events captured yet.",
+      isSearch ? "Try a shorter query, or clear the search to return to the live tail." : "Events appear here as the application runs."));
+    return;
   }
-}
-
-function renderLogs(d, isSearch) {
-  const box = $("#logBody");
-  clear(box);
-  const evs = d.events || [];
-  if (!evs.length) { box.append(h("div", { class: "dim" }, isSearch ? "No events match the search." : "No new events.")); return; }
-  const t = h("table", null, h("thead", null, h("tr", null, ["Time", "Level", "Code", "Message"].map((c) => h("th", null, c)))));
-  const b = h("tbody");
-  evs.forEach((e) => {
-    const row = h("tr", null,
-      h("td", { class: "num" }, stamp(e.at)),
-      h("td", null, h("span", { class: "tag " + (e.levelName === "error" ? "bad" : e.levelName === "warn" ? "warn" : "info") }, e.levelName)),
-      h("td", { class: "mono" }, e.code || ""),
-      h("td", null, e.message, e.detail ? h("details", null, h("summary", null, "details"), h("pre", null, e.detail)) : null));
-    b.append(row);
+  const stream = h("div", { class: "logstream" });
+  events.forEach((e) => {
+    const id = e.seq || (e.at + "|" + e.code);
+    const sel = logSelected.has(id);
+    const line = h("div", { class: "logline" + (sel ? " sel" : "") },
+      h("input", { type: "checkbox", checked: sel, style: "margin-top:3px", onchange: (ev) => { if (ev.target.checked) logSelected.add(id); else logSelected.delete(id); } }),
+      h("span", { class: "lt" }, clock(e.at)),
+      h("span", { class: "lv " + logLevelName(e) }, logLevelName(e)),
+      h("span", { class: "lc" }, e.code || ""),
+      h("span", { class: "lm" }, e.message || ""),
+      h("button", { class: "btn ghost sm copybtn", title: "copy this entry", onclick: () => copyText(logLineText(e), "Entry copied.") }, "⧉"));
+    stream.append(line);
   });
-  t.append(b);
-  box.append(t);
-  box.append(h("div", { class: "small dim mt" }, evs.length + " event(s) · newest first? order shown is as stored"));
+  body.append(h("div", { class: "row between", style: "margin-bottom:8px" },
+    h("span", { class: "small dim" }, (isSearch ? "Search results: " : "Live tail: ") + events.length + " event" + (events.length === 1 ? "" : "s") + (logSelected.size ? " · " + logSelected.size + " selected" : "")),
+    h("span", { class: "tiny faint" }, "Newest first")));
+  body.append(stream);
 }
 
-/* ---------- settings ---------- */
+function logLineText(e) {
+  return [e.at, (e.levelName || "info").toUpperCase(), e.code || "", e.message || ""].join("  ");
+}
+
+function visibleLogEvents() {
+  return Array.from(document.querySelectorAll("#logBody .logline")).map((n) => n.querySelector(".lm").textContent);
+}
+
+function logsAs(kind, events) {
+  if (kind === "json") return JSON.stringify(events.map((e) => ({ at: e.at, level: e.levelName, code: e.code, message: e.message })), null, 2);
+  if (kind === "md") {
+    const lines = ["# NetMerge log export", "", "Exported " + new Date().toISOString() + ". Public IPs, MACs, serials, hostnames and paths are redacted per the current privacy settings.", "", "| Time | Level | Code | Message |", "|---|---|---|---|"];
+    events.forEach((e) => lines.push("| " + [e.at, (e.levelName || "info"), e.code || "", (e.message || "").replace(/\|/g, "\\|")].join(" | ") + " |"));
+    return lines.join("\n");
+  }
+  // txt
+  return events.map(logLineText).join("\n");
+}
+
+function currentLogEvents() {
+  // Pull a fresh copy for export so it respects the current level/search rather than the DOM text.
+  const lvl = $("#logLevel").value;
+  const q = $("#logQuery").value.trim();
+  return api("/api/logs?level=" + encodeURIComponent(lvl) + "&limit=1000" + (q ? "&q=" + encodeURIComponent(q) : "")).then((d) => d.events || []);
+}
+
+async function exportLogs(kind, btn) {
+  await guard(async () => {
+    const events = await currentLogEvents();
+    if (!events.length) { toast("warn", "No log events to export."); return; }
+    const text = logsAs(kind, events);
+    const name = "net-merge-logs." + (kind === "md" ? "md" : kind === "json" ? "json" : "txt");
+    downloadText(name, text);
+    toast("ok", "Log exported as " + name + " (" + events.length + " events).", "Secrets and personal data are redacted per your privacy settings.");
+  }, btn);
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = h("a", { href: url, download: filename });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function copyLogs(kind) {
+  currentLogEvents().then((events) => {
+    if (!events.length) { toast("warn", "No log events to copy."); return; }
+    copyText(logsAs(kind, events), events.length + " events copied as " + (kind === "md" ? "Markdown" : kind === "json" ? "JSON" : "text") + ".");
+  }, (e) => toast("bad", "Could not read logs.", e.message, e.code));
+}
+
+/* ---------- profiles & settings ---------- */
 
 let settingsCfg = null;
+let editingProfile = null;   // profile id being edited inline
+let profileDirty = false;
 
-async function loadSettings() {
+async function loadSettings(btn) {
   await guard(async () => {
-    settingsView = await api("/api/settings");
-    settingsCfg = settingsView.config;
+    const d = await api("/api/settings");
+    settingsCfg = d.config;
+    settingsView = d;
+    profileDirty = false;
     renderSettings();
+  }, btn);
+}
+
+const PROFILE_FIELD_HELP = {
+  include: "Adapter names to use. Empty means every adapter the engine considers usable.",
+  exclude: "Adapter names to leave out. The Control Center turns this into the inclusion list handed to the engine.",
+  weights: "Fixed per-adapter weights. Present only when the profile pins weights.",
+  autoWeight: "Weight adapters by measured throughput (engine -auto-weight).",
+  ipv6: "IPv6 handling: auto (use only if every adapter has it), on, or off (push apps to IPv4 so every adapter is used).",
+  mtu: "Engine MTU. 0 leaves the engine default.",
+  latencyBudgetMs: "Round-trip time above which a link is marked over budget for this profile. 0 = no budget.",
+  probeLinkLatency: "Enable the per-link TCP latency probe (the most expensive thing the monitor does).",
+  preferLowerLatency: "Advice flag: prefer the lower-latency link. Shown as advice, never enforced as a scheduler rule.",
+};
+
+function renderSettings() {
+  const body = $("#settingsBody");
+  clear(body);
+  if (!settingsCfg) { body.append(emptyState("⚙", "Loading settings…")); return; }
+  if (settingsView && settingsView.loadError) body.append(h("div", { class: "notice warn" }, "The settings file could not be loaded cleanly: " + settingsView.loadError));
+  if (settingsView && settingsView.stale) body.append(h("div", { class: "notice info" }, settingsView.staleReason || "These settings are not yet saved to disk."));
+
+  /* ---- profiles ---- */
+  const profPanel = h("div", { class: "panel" });
+  profPanel.append(h("h3", null, "Profiles", h("span", { class: "hint" }, "named configurations; selecting one never changes the running engine on its own")));
+  profPanel.append(profileToolbar());
+  profPanel.append(profileList());
+  body.append(profPanel);
+
+  /* ---- app settings tabs ---- */
+  const tabs = h("div", { class: "tabs" });
+  const panels = {};
+  const groups = [["dashboard", "Dashboard"], ["logging", "Logging"], ["privacy", "Privacy & redaction"], ["diagnostics", "Diagnostics targets"]];
+  groups.forEach(([key, label], i) => {
+    const p = h("div", { class: "panel" });
+    panels[key] = p;
+    tabs.append(h("button", { class: i === 0 ? "active" : "", onclick: (e) => {
+      Object.values(panels).forEach((x) => x.classList.add("hidden"));
+      tabs.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+      e.target.classList.add("active"); p.classList.remove("hidden");
+    } }, label));
+  });
+  body.append(tabs);
+  groups.forEach(([key], i) => { if (i > 0) panels[key].classList.add("hidden"); });
+
+  // dashboard
+  const d = settingsCfg.dashboard;
+  panels.dashboard.append(h("div", { class: "grid2" },
+    field("Listen address (loopback only)", d.listen, (v) => d.listen = v, "The dashboard refuses a routable address — this is what keeps it private."),
+    fieldNum("Monitor interval (ms)", d.intervalMs, (v) => d.intervalMs = v, "How often the shared adapter snapshot is refreshed."),
+    fieldNum("Health probe interval (ms, negative = off)", d.healthIntervalMs, (v) => d.healthIntervalMs = v, "One TCP connect per eligible adapter per round."),
+    check("Open browser on start", !!d.openBrowser, (v) => d.openBrowser = v)));
+  body.append(panels.dashboard);
+
+  // logging
+  const lg = settingsCfg.logging;
+  panels.logging.append(h("div", { class: "grid2" },
+    selectField("Log level", ["debug", "info", "warn", "error"], lg.level, (v) => lg.level = v, "Written to the rotating files on disk."),
+    fieldNum("Log file max bytes", lg.maxBytes, (v) => lg.maxBytes = v),
+    fieldNum("Log files kept", lg.maxFiles, (v) => lg.maxFiles = v),
+    fieldNum("In-memory events kept", lg.ringEvents, (v) => lg.ringEvents = v, "Shown in the Logs section.")));
+  body.append(panels.logging);
+
+  // privacy
+  const pv = settingsCfg.privacy;
+  const pg = h("div", { class: "grid2" });
+  [["redactPublicIPs", "Redact public IP addresses"], ["keepWellKnownPublicIPs", "Keep well-known public resolvers readable"],
+   ["redactMACs", "Redact MAC addresses (vendor prefix kept)"], ["redactSerials", "Redact serials, IMEIs, USB instance paths"],
+   ["redactPaths", "Redact the account name in paths"], ["redactHostNames", "Redact machine and account names"],
+   ["includeHostname", "Include the machine name in the report"], ["redactAdapterNames", "Redact adapter names"]]
+    .forEach(([k, label]) => pg.append(check(label, !!pv[k], (v) => pv[k] = v)));
+  panels.privacy.append(pg);
+  panels.privacy.append(h("div", { class: "notice info mt" }, "These apply to the diagnostics export and log export. Credentials are always redacted regardless of these switches."));
+  body.append(panels.privacy);
+
+  // diagnostics
+  const dx = settingsCfg.diagnostics;
+  panels.diagnostics.append(h("div", { class: "grid2" },
+    field("TCP / latency endpoint", dx.endpoint, (v) => dx.endpoint = v),
+    field("DNS server (optional)", dx.dnsServer, (v) => dx.dnsServer = v),
+    field("DNS name to resolve", dx.dnsName, (v) => dx.dnsName = v),
+    field("Traceroute target", dx.tracerouteTarget, (v) => dx.tracerouteTarget = v),
+    field("UDP probe target", dx.udpTarget, (v) => dx.udpTarget = v),
+    field("Path-MTU host", dx.mtuHost, (v) => dx.mtuHost = v),
+    fieldNum("Per-command timeout (ms)", dx.timeoutMs, (v) => dx.timeoutMs = v),
+    fieldNum("Traceroute timeout (ms)", dx.tracerouteTimeoutMs, (v) => dx.tracerouteTimeoutMs = v)));
+  body.append(panels.diagnostics);
+
+  if (profileDirty) body.append(h("div", { class: "notice warn mt" }, "You have unsaved profile edits. Nothing is on disk until you press “Save settings”."));
+}
+
+function field(label, value, onInput, help) {
+  const i = h("input", { type: "text", value: value || "", oninput: (e) => onInput(e.target.value) });
+  return h("label", { class: "field" }, h("span", null, label), i, help ? h("span", { class: "help" }, help) : null);
+}
+function fieldNum(label, value, onInput, help) {
+  const i = h("input", { type: "number", value: value || 0, oninput: (e) => onInput(Number(e.target.value)) });
+  return h("label", { class: "field" }, h("span", null, label), i, help ? h("span", { class: "help" }, help) : null);
+}
+function check(label, value, onInput, help) {
+  const i = h("input", { type: "checkbox", checked: !!value, onchange: (e) => onInput(e.target.checked) });
+  return h("label", { class: "field" }, h("span", null, label), i, help ? h("span", { class: "help" }, help) : null);
+}
+function selectField(label, options, value, onInput, help) {
+  const s = h("select", null, options.map((o) => h("option", o === value ? { value: o, selected: true } : { value: o }, o)));
+  s.addEventListener("change", (e) => onInput(e.target.value));
+  return h("label", { class: "field" }, h("span", null, label), s, help ? h("span", { class: "help" }, help) : null);
+}
+
+function profileToolbar() {
+  const ids = settingsView && settingsView.profileOrder ? settingsView.profileOrder : Object.keys(settingsCfg.profiles || {});
+  const sel = h("select", null, ids.map((id) => h("option", id === settingsCfg.activeProfile ? { value: id, selected: true } : { value: id }, (settingsCfg.profiles[id] || {}).name || id)));
+  sel.addEventListener("change", () => { settingsCfg.activeProfile = sel.value; editingProfile = null; renderSettings(); });
+  return h("div", { class: "row between spread" },
+    h("div", { class: "row" }, h("span", { class: "small dim" }, "Selected profile:"), sel,
+      h("span", { class: "tag info" }, "selection only — no live change")),
+    h("div", { class: "row tight" },
+      h("button", { class: "btn secondary sm", onclick: () => duplicateProfile() }, "Duplicate"),
+      h("button", { class: "btn secondary sm", onclick: () => renameProfile() }, "Rename"),
+      h("button", { class: "btn danger sm", onclick: () => deleteProfile() }, "Delete")));
+}
+
+function profileList() {
+  const wrap = h("div");
+  const ids = settingsView && settingsView.profileOrder ? settingsView.profileOrder : Object.keys(settingsCfg.profiles || {});
+  const grid = h("div", { class: "grid2 mt" });
+  ids.forEach((id) => {
+    const p = settingsCfg.profiles[id];
+    if (!p) return;
+    const isActive = id === settingsCfg.activeProfile;
+    const editing = editingProfile === id;
+    const cardEl = h("div", { class: "card", style: "padding:14px" },
+      h("div", { class: "row between" },
+        h("div", { class: "row tight" }, h("strong", null, p.name || id), isActive ? badge("selected", "ok") : null),
+        h("button", { class: "btn ghost sm", onclick: () => { editingProfile = editing ? null : id; renderSettings(); } }, editing ? "Done" : "Edit")),
+      p.description ? h("div", { class: "small dim", style: "margin-top:4px" }, p.description) : null,
+      h("div", { class: "small mt" }, "Engine flags: ", h("span", { class: "mono" }, requestedFlags(p))),
+      editing ? profileEditor(id, p) : null);
+    grid.append(cardEl);
+  });
+  wrap.append(grid);
+  wrap.append(h("div", { class: "small dim mt" }, "A profile is a request expressed in real engine flags. It is stored in the settings file and shown to the engine the next time it starts. Editing or selecting one here does not restart or reconfigure a running engine."));
+  return wrap;
+}
+
+function profileEditor(id, p) {
+  const e = p.engine || (p.engine = {});
+  const m = p.monitor || (p.monitor = {});
+  const mark = () => { profileDirty = true; };
+  const inc = h("input", { type: "text", value: (e.include || []).join(", "), oninput: (ev) => { e.include = ev.target.value.split(",").map((s) => s.trim()).filter(Boolean); mark(); } });
+  const exc = h("input", { type: "text", value: (e.exclude || []).join(", "), oninput: (ev) => { e.exclude = ev.target.value.split(",").map((s) => s.trim()).filter(Boolean); mark(); } });
+  const wt = h("input", { type: "text", value: Object.keys(e.weights || {}).map((k) => k + "=" + e.weights[k]).join(", "), oninput: (ev) => {
+    const w = {}; ev.target.value.split(",").forEach((part) => { const i = part.lastIndexOf("="); if (i > 0) { const n = parseFloat(part.slice(i + 1)); if (isFinite(n) && n > 0) w[part.slice(0, i).trim()] = n; } }); e.weights = w; mark();
+  } });
+  const ipv6 = selectField("IPv6 mode", ["auto", "on", "off"], e.ipv6 || "auto", (v) => { e.ipv6 = v; mark(); }, PROFILE_FIELD_HELP.ipv6);
+  const mtu = h("input", { type: "number", value: e.mtu || 0, oninput: (ev) => { e.mtu = Number(ev.target.value); mark(); } });
+  const auto = check("Weight by measured throughput", e.autoWeight !== false, (v) => { e.autoWeight = v; mark(); }, PROFILE_FIELD_HELP.autoWeight);
+  const lat = h("input", { type: "number", value: m.latencyBudgetMs || 0, oninput: (ev) => { m.latencyBudgetMs = Number(ev.target.value); mark(); } });
+  const probe = check("Probe per-link latency", !!m.probeLinkLatency, (v) => { m.probeLinkLatency = v; mark(); });
+  const prefer = check("Prefer lower-latency link (advice)", !!m.preferLowerLatency, (v) => { m.preferLowerLatency = v; mark(); });
+  const g = h("div", { class: "grid2 mt" },
+    fieldHelp("Include adapters", inc, PROFILE_FIELD_HELP.include),
+    fieldHelp("Exclude adapters", exc, PROFILE_FIELD_HELP.exclude),
+    fieldHelp("Weights (Name=value)", wt, PROFILE_FIELD_HELP.weights),
+    ipv6,
+    fieldHelp("Engine MTU", mtu, PROFILE_FIELD_HELP.mtu),
+    auto, probe, prefer);
+  return h("div", { class: "mt", style: "border-top:1px solid var(--line);padding-top:10px" }, g);
+}
+
+function fieldHelp(label, input, help) {
+  return h("label", { class: "field" }, h("span", null, label), input, help ? h("span", { class: "help" }, help) : null);
+}
+
+function newProfileId(base) {
+  const ids = new Set(Object.keys(settingsCfg.profiles || {}));
+  let n = 1, id = base;
+  while (ids.has(id)) { id = base + "-" + (++n); }
+  return id;
+}
+
+function duplicateProfile() {
+  const srcId = settingsCfg.activeProfile;
+  const src = settingsCfg.profiles[srcId];
+  if (!src) return;
+  const id = newProfileId(srcId + "-copy");
+  const copy = JSON.parse(JSON.stringify(src));
+  copy.id = id; copy.name = (src.name || srcId) + " (copy)";
+  settingsCfg.profiles[id] = copy;
+  if (settingsView && settingsView.profileOrder) settingsView.profileOrder.push(id);
+  settingsCfg.activeProfile = id; editingProfile = id; profileDirty = true;
+  renderSettings();
+  toast("info", "Duplicated “" + (src.name || srcId) + "”. Press Save settings to persist it.");
+}
+
+function renameProfile() {
+  const id = settingsCfg.activeProfile;
+  const p = settingsCfg.profiles[id];
+  if (!p) return;
+  const name = prompt("Rename profile", p.name || id);
+  if (name === null) return;
+  p.name = name.trim() || id;
+  profileDirty = true; renderSettings();
+}
+
+function deleteProfile() {
+  const id = settingsCfg.activeProfile;
+  const ids = Object.keys(settingsCfg.profiles || {});
+  if (ids.length <= 1) { toast("warn", "At least one profile must remain."); return; }
+  const p = settingsCfg.profiles[id];
+  confirmModal({
+    title: "Delete profile", danger: true, confirm: "Delete",
+    body: h("div", null, "Delete the profile ", h("strong", null, (p && p.name) || id), "? This only removes it from the settings file — it never touches the running engine."),
+  }).then((ok) => {
+    if (!ok) return;
+    delete settingsCfg.profiles[id];
+    if (settingsView && settingsView.profileOrder) settingsView.profileOrder = settingsView.profileOrder.filter((x) => x !== id);
+    settingsCfg.activeProfile = Object.keys(settingsCfg.profiles)[0];
+    editingProfile = null; profileDirty = true; renderSettings();
   });
 }
 
-function renderSettings() {
-  const box = $("#settingsBody");
-  clear(box);
-  if (!settingsCfg) { box.append(h("div", { class: "dim" }, "Loading…")); return; }
-
-  if (settingsView.loadError) {
-    box.append(h("div", { class: "notice bad" },
-      h("strong", null, "The settings file could not be read. "),
-      settingsView.loadError,
-      h("div", { class: "small" }, "The defaults are shown; the file on disk has not been changed. Fix the problem and reload.")));
-  }
-  if (settingsView.stale) {
-    box.append(h("div", { class: "notice info" },
-      h("strong", null, "This settings file was written by a different build. "),
-      settingsView.staleReason));
-  }
-  box.append(h("div", { class: "small dim" }, "File: ", h("span", { class: "mono" }, settingsView.path), settingsView.existed ? "" : " (not created yet — defaults are in use)"));
-
-  /* profiles */
-  const prof = h("div", { class: "panel" }, h("h3", null, "Quality profile"));
-  const sel = h("select");
-  (settingsView.profileOrder || Object.keys(settingsCfg.profiles)).forEach((id) => {
-    const p = settingsCfg.profiles[id] || { name: id };
-    sel.append(h("option", id === settingsCfg.activeProfile ? { value: id, selected: true } : { value: id }, p.name + " (" + id + ")"));
-  });
-  sel.addEventListener("change", () => {
-    settingsCfg.activeProfile = sel.value;
-    renderSettings();
-  });
-  prof.append(h("div", { class: "grid2" }, h("label", { class: "field" }, h("span", null, "Active profile"), sel)));
-
-  const p = settingsCfg.profiles[settingsCfg.activeProfile];
-  if (p) {
-    prof.append(h("div", { class: "small dim mt" }, p.description || ""));
-    const e = p.engine || (p.engine = {});
-    const inc = h("input", { type: "text", value: (e.include || []).join(", "), onchange: () => { e.include = inc.value.split(",").map((s) => s.trim()).filter(Boolean); } });
-    const exc = h("input", { type: "text", value: (e.exclude || []).join(", "), onchange: () => { e.exclude = exc.value.split(",").map((s) => s.trim()).filter(Boolean); } });
-    const wt = h("input", { type: "text", value: Object.keys(e.weights || {}).map((k) => k + "=" + e.weights[k]).join(", "), onchange: () => {
-      const w = {};
-      wt.value.split(",").forEach((part) => {
-        const i = part.lastIndexOf("=");
-        if (i > 0) { const n = parseFloat(part.slice(i + 1)); if (isFinite(n) && n > 0) w[part.slice(0, i).trim()] = n; }
-      });
-      e.weights = w;
-    } });
-    const ipv6 = h("select", null, ["auto", "on", "off"].map((v) => h("option", v === (e.ipv6 || "auto") ? { value: v, selected: true } : { value: v }, v)));
-    ipv6.addEventListener("change", () => { e.ipv6 = ipv6.value; });
-    const mtu = h("input", { type: "number", value: e.mtu || 0, onchange: () => { e.mtu = Number(mtu.value); } });
-    const auto = h("input", { type: "checkbox", checked: e.autoWeight !== false, onchange: () => { e.autoWeight = auto.checked; } });
-    const lat = h("input", { type: "number", value: (p.monitor && p.monitor.latencyBudgetMs) || 0, onchange: () => { p.monitor = p.monitor || {}; p.monitor.latencyBudgetMs = Number(lat.value); } });
-    const probe = h("input", { type: "checkbox", checked: !!(p.monitor && p.monitor.probeLinkLatency), onchange: () => { p.monitor = p.monitor || {}; p.monitor.probeLinkLatency = probe.checked; } });
-    const prefer = h("input", { type: "checkbox", checked: !!(p.monitor && p.monitor.preferLowerLatency), onchange: () => { p.monitor = p.monitor || {}; p.monitor.preferLowerLatency = prefer.checked; } });
-    prof.append(h("div", { class: "grid2 mt" },
-      h("label", { class: "field" }, h("span", null, "Include adapters"), inc),
-      h("label", { class: "field" }, h("span", null, "Exclude adapters"), exc),
-      h("label", { class: "field" }, h("span", null, "Weights (Name=value)"), wt),
-      h("label", { class: "field" }, h("span", null, "IPv6 mode"), ipv6),
-      h("label", { class: "field" }, h("span", null, "Engine MTU"), mtu),
-      h("label", { class: "field" }, h("span", null, "Weight by measured throughput"), auto),
-      h("label", { class: "field" }, h("span", null, "Latency budget (ms, 0 = none)"), lat),
-      h("label", { class: "field" }, h("span", null, "Probe per-link latency"), probe),
-      h("label", { class: "field" }, h("span", null, "Prefer lower-latency link (advice)"), prefer)));
-    prof.append(h("div", { class: "small dim mt" }, "Requested engine flags: ", h("span", { class: "mono" }, requestedFlags(p))));
-  }
-  box.append(prof);
-
-  /* dashboard + logging */
-  const d = settingsCfg.dashboard, lg = settingsCfg.logging, pv = settingsCfg.privacy, dx = settingsCfg.diagnostics;
-  const dash = h("div", { class: "panel" }, h("h3", null, "Dashboard and logs"));
-  const listen = h("input", { type: "text", value: d.listen || "", onchange: () => { d.listen = listen.value; } });
-  const interval = h("input", { type: "number", value: d.intervalMs, onchange: () => { d.intervalMs = Number(interval.value); } });
-  const open = h("input", { type: "checkbox", checked: !!d.openBrowser, onchange: () => { d.openBrowser = open.checked; } });
-  const lvl = h("select", null, ["debug", "info", "warn", "error"].map((v) => h("option", v === lg.level ? { value: v, selected: true } : { value: v }, v)));
-  lvl.addEventListener("change", () => { lg.level = lvl.value; });
-  const maxBytes = h("input", { type: "number", value: lg.maxBytes, onchange: () => { lg.maxBytes = Number(maxBytes.value); } });
-  const maxFiles = h("input", { type: "number", value: lg.maxFiles, onchange: () => { lg.maxFiles = Number(maxFiles.value); } });
-  const ring = h("input", { type: "number", value: lg.ringEvents, onchange: () => { lg.ringEvents = Number(ring.value); } });
-  dash.append(h("div", { class: "grid2" },
-    h("label", { class: "field" }, h("span", null, "Listen address (loopback only)"), listen),
-    h("label", { class: "field" }, h("span", null, "Monitor interval (ms)"), interval),
-    h("label", { class: "field" }, h("span", null, "Open browser on start"), open),
-    h("label", { class: "field" }, h("span", null, "Log level"), lvl),
-    h("label", { class: "field" }, h("span", null, "Log file max bytes"), maxBytes),
-    h("label", { class: "field" }, h("span", null, "Log files kept"), maxFiles),
-    h("label", { class: "field" }, h("span", null, "In-memory events kept"), ring)));
-  box.append(dash);
-
-  /* privacy */
-  const priv = h("div", { class: "panel" }, h("h3", null, "Export privacy", h("span", { class: "hint" }, "credentials are always redacted")));
-  const pChecks = [
-    ["redactPublicIPs", "Redact public IP addresses"],
-    ["keepWellKnownPublicIPs", "Keep well-known public resolvers readable"],
-    ["redactMACs", "Redact MAC addresses (vendor prefix kept)"],
-    ["redactSerials", "Redact serial numbers, IMEIs, USB instance paths"],
-    ["redactPaths", "Redact the account name in paths"],
-    ["redactHostNames", "Redact the machine and account names"],
-    ["includeHostname", "Include the machine name in the report"],
-    ["redactAdapterNames", "Redact adapter names"],
-  ];
-  const grid = h("div", { class: "grid2" });
-  pChecks.forEach(([k, label]) => {
-    const i = h("input", { type: "checkbox", checked: !!pv[k], onchange: () => { pv[k] = i.checked; } });
-    grid.append(h("label", { class: "field" }, h("span", null, label), i));
-  });
-  priv.append(grid);
-  box.append(priv);
-
-  /* diagnostics targets */
-  const diagP = h("div", { class: "panel" }, h("h3", null, "Diagnostic targets"));
-  const f = (name, label) => {
-    const i = h("input", { type: "text", value: dx[name] || "", onchange: () => { dx[name] = i.value.trim(); } });
-    return h("label", { class: "field" }, h("span", null, label), i);
-  };
-  const nf = (name, label) => {
-    const i = h("input", { type: "number", value: dx[name] || 0, onchange: () => { dx[name] = Number(i.value); } });
-    return h("label", { class: "field" }, h("span", null, label), i);
-  };
-  diagP.append(h("div", { class: "grid2" },
-    f("endpoint", "TCP / latency endpoint (host:port)"),
-    f("dnsServer", "DNS server to target (optional)"),
-    f("dnsName", "DNS name to resolve"),
-    f("tracerouteTarget", "Traceroute target"),
-    f("udpTarget", "UDP probe target (host:port)"),
-    f("mtuHost", "Path-MTU host"),
-    nf("timeoutMs", "Per-command timeout (ms)"),
-    nf("tracerouteTimeoutMs", "Traceroute timeout (ms)")));
-  box.append(diagP);
-
-  const actions = h("div", { class: "row spread" }, h("button", { class: "btn", onclick: (e) => guard(async () => {
-    const d2 = await api("/api/settings", { method: "PUT", body: settingsCfg });
-    toast("ok", "Settings saved.", d2.path);
-    loadSettings();
-  }, e.target) }, "Save settings"));
-  box.append(actions);
+async function saveSettings(btn) {
+  await guard(async () => {
+    const d = await api("/api/settings", { method: "PUT", body: settingsCfg });
+    profileDirty = false;
+    toast("ok", "Settings saved.", d.path);
+    // reload to get the server's normalized view (validation, ordering)
+    await loadSettings();
+  }, btn);
 }
 
 /* ---------- boot ---------- */
 
 async function pollStateOnce() {
   state = await api("/api/state");
-  renderBadge(); renderOverview(); renderConnections(); renderRouting();
+  renderBadge();
+  if (currentView === "overview") renderOverview();
+  else if (currentView === "connections") renderConnections();
+  else if (currentView === "routing") renderRouting();
+  else { renderOverview(); renderConnections(); renderRouting(); }
 }
 
 async function stateLoop() {
@@ -1175,26 +1599,59 @@ async function stateLoop() {
   setTimeout(stateLoop, 2000);
 }
 
-document.querySelectorAll("#nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
-$("#connRefresh").addEventListener("click", (e) => guard(async () => { state = await api("/api/refresh", { method: "POST", body: {} }); renderBadge(); renderOverview(); renderConnections(); renderRouting(); toast("ok", "Snapshot refreshed."); }, e.target));
+function renderAll() { renderOverview(); renderConnections(); renderRouting(); }
+
+function renderFooter() {
+  const f = $("#foot");
+  if (!state || !state.app) { clear(f); return; }
+  const a = state.app;
+  clear(f);
+  f.append(h("div", null, "v", a.version || "?", " · ", a.platform || "?", "/", a.arch || "?"),
+    h("div", { class: "mono tiny", style: "word-break:break-all" }, a.dashboard || ""),
+    a.elevated ? h("div", { style: "color:var(--ok)" }, "elevated") : h("div", null, "not elevated"));
+}
+
+/* ---------- wiring ---------- */
+
+document.querySelectorAll("#nav button, #nav2 button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
+
+$("#ovRefresh").addEventListener("click", (e) => guard(async () => { state = await api("/api/refresh", { method: "POST", body: {} }); renderAll(); toast("ok", "Snapshot refreshed."); }, e.target));
+$("#connRefresh").addEventListener("click", (e) => guard(async () => { state = await api("/api/refresh", { method: "POST", body: {} }); renderAll(); toast("ok", "Snapshot refreshed."); }, e.target));
 $("#ttlReload").addEventListener("click", (e) => loadTTL(e.target));
 $("#diagRunAll").addEventListener("click", (e) => runDiag(true, e.target));
 $("#diagRunSel").addEventListener("click", (e) => runDiag(false, e.target));
-$("#diagCancel").addEventListener("click", (e) => guard(async () => {
-  if (!diagJobId) return;
-  const j = await api("/api/diag/cancel", { method: "POST", body: { id: diagJobId } });
-  toast("warn", "Cancellation requested for " + j.id + ".");
-}, e.target));
+$("#diagCancel").addEventListener("click", (e) => cancelDiag(e.target));
 $("#exportStart").addEventListener("click", (e) => startExport(e.target));
 $("#exportSave").addEventListener("click", (e) => saveExport(e.target));
-$("#exportCopy").addEventListener("click", () => {
-  if (!lastExport) return;
-  navigator.clipboard.writeText(lastExport.json).then(() => toast("ok", "The redacted JSON is on the clipboard."), () => toast("warn", "Clipboard access was refused by the browser."));
-});
-$("#logClearSearch").addEventListener("click", () => { $("#logQuery").value = ""; logCursor = 0; pollLogs(); });
-let logDebounce = null;
-$("#logQuery").addEventListener("input", () => { clearTimeout(logDebounce); logDebounce = setTimeout(() => { logCursor = 0; pollLogs(); }, 300); });
+$("#exportCopy").addEventListener("click", () => copyExport());
 $("#logLevel").addEventListener("change", () => { logCursor = 0; pollLogs(); });
+$("#logQuery").addEventListener("input", () => { clearTimeout(window.__logq); window.__logq = setTimeout(() => { logCursor = 0; pollLogs(); }, 300); });
+$("#logClearSearch").addEventListener("click", () => { $("#logQuery").value = ""; logCursor = 0; pollLogs(); });
+$("#logCopySel").addEventListener("click", () => {
+  const sel = Array.from(document.querySelectorAll("#logBody .logline.sel")).map((n) => n.querySelector(".lm").textContent);
+  if (!sel.length) { toast("warn", "No entries selected."); return; }
+  copyText(sel.join("\n"), sel.length + " selected entries copied.");
+});
+$("#logCopyAll").addEventListener("click", () => {
+  const all = Array.from(document.querySelectorAll("#logBody .logline .lm")).map((n) => n.textContent);
+  if (!all.length) { toast("warn", "No visible entries."); return; }
+  copyText(all.join("\n"), all.length + " visible entries copied.");
+});
+$("#logExportMd").addEventListener("click", (e) => exportLogs("md", e.target));
+$("#logExportTxt").addEventListener("click", (e) => exportLogs("txt", e.target));
+$("#logExportJson").addEventListener("click", (e) => exportLogs("json", e.target));
+$("#settingsSave").addEventListener("click", (e) => saveSettings(e.target));
 
-stateLoop();
-loadCodeRegistry();
+// original boot
+(async function boot() {
+  await loadCodeRegistry();
+  renderFooter();
+  stateLoop();
+  const footTimer = setInterval(() => { if (state) { renderFooter(); } }, 5000);
+  // initial view content
+  renderAll();
+})();
+
+
+
+

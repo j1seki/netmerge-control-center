@@ -9,134 +9,177 @@
 <body>
 <div id="app">
   <aside>
-    <h1>NetMerge<br><span>Control Center</span></h1>
-    <div id="engineBadge"><span class="dim">engine…</span></div>
+    <div class="brand">
+      <div class="logo">⬡</div>
+      <h1>NetMerge<span>Control Center</span></h1>
+    </div>
+    <div id="engineBadge"><span class="dim">connecting…</span></div>
+
+    <div class="navlabel">Monitor</div>
     <nav id="nav">
-      <button data-view="overview" class="active">1 · Overview</button>
-      <button data-view="connections">2 · Connections</button>
-      <button data-view="routing">3 · Routing</button>
-      <button data-view="ttl">4 · TTL / Hop limit</button>
-      <button data-view="diag">5 · Diagnostics</button>
-      <button data-view="logs">6 · Logs</button>
-      <button data-view="settings">7 · Settings</button>
+      <button data-view="overview" class="active"><span class="ic">▤</span>Overview</button>
+      <button data-view="connections"><span class="ic">⇄</span>Connections<span class="count" id="navConnCount"></span></button>
+      <button data-view="routing"><span class="ic">⌖</span>Routing</button>
     </nav>
+
+    <div class="navlabel">Control</div>
+    <nav id="nav2">
+      <button data-view="ttl"><span class="ic">⏱</span>TTL / Hop limit</button>
+      <button data-view="diag"><span class="ic">🩺</span>Diagnostics</button>
+      <button data-view="logs"><span class="ic">≡</span>Logs</button>
+      <button data-view="settings"><span class="ic">⚙</span>Profiles &amp; Settings</button>
+    </nav>
+
     <footer id="foot"></footer>
   </aside>
 
   <main>
+    <!-- ================= OVERVIEW ================= -->
     <section id="view-overview" class="view active">
-      <h2>Overview</h2>
-      <p class="sub">Live state of every adapter and of the bonding engine, refreshed every few
-        seconds from one shared monitor. No demo values: what is not known is shown as unknown.</p>
-      <div id="ovCards" class="cards"></div>
-      <div id="ovWarnings"></div>
-      <div class="panel">
-        <h3>Links <span class="hint">link speed is what the hardware negotiated, not a throughput claim</span></h3>
-        <div id="ovLinks"></div>
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Monitor</div>
+          <h2>Overview</h2>
+          <p class="sub">Live health of every adapter and the bonding engine, from one shared
+            monitor. Nothing here is a demo value — what is unknown is shown as unknown, never as zero.</p>
+        </div>
+        <div class="row">
+          <button class="btn secondary" id="ovRefresh">↻ Refresh snapshot</button>
+        </div>
       </div>
+
+      <div id="ovSummary" class="summary-strip"></div>
+      <div id="ovWarnings" class="mt"></div>
+
+      <div class="cards wide mt2" id="ovCards"></div>
+
+      <div class="panel">
+        <h3>Traffic <span class="hint">measured per-link byte rates over the last interval — not an aggregate-bandwidth claim</span></h3>
+        <div id="ovTraffic"></div>
+      </div>
+
       <div class="panel">
         <h3>Engine</h3>
         <div id="ovEngine"></div>
       </div>
     </section>
 
+    <!-- ================= CONNECTIONS ================= -->
     <section id="view-connections" class="view">
-      <h2>Connections</h2>
-      <p class="sub">Per-adapter detail: identity, addressing, DNS, routing, counters and the
-        engine's use of each link, with the reason whenever a link is excluded.</p>
-      <div class="row between">
-        <div id="connCount" class="dim"></div>
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Monitor</div>
+          <h2>Connections</h2>
+          <p class="sub">Per-adapter identity, addressing, DNS, routing, counters and the engine's
+            use of each link, with the reason whenever a link is excluded.</p>
+        </div>
         <div class="row">
           <button class="btn secondary" id="connRefresh">Take a fresh snapshot</button>
         </div>
       </div>
-      <div id="connBody" class="mt"></div>
+      <div id="connCount" class="small dim" style="margin-bottom:12px"></div>
+      <div id="connBody"></div>
     </section>
 
+    <!-- ================= ROUTING ================= -->
     <section id="view-routing" class="view">
-      <h2>Routing and profile</h2>
-      <p class="sub">Which profile is active, what it asks the engine for, and what the engine is
-        actually doing. A profile is a request expressed in real engine flags; the engine's own
-        status file is the truth about what happened.</p>
-      <div class="panel">
-        <h3>Active profile</h3>
-        <div id="routeProfile"></div>
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Monitor</div>
+          <h2>Routing &amp; paths</h2>
+          <p class="sub">Which profile is active, what the engine is actually doing, and how traffic
+            reaches the internet. The engine's own status file is the truth about what happened.</p>
+        </div>
       </div>
+      <div id="routeProfile"></div>
       <div class="panel">
-        <h3>Engine status</h3>
-        <div id="routeEngine"></div>
+        <h3>Topology</h3>
+        <div id="routeTopo"></div>
       </div>
       <div class="panel">
         <h3>Cross-adapter observations</h3>
         <div id="routeCross"></div>
       </div>
-      <div class="panel">
-        <h3>Default routes</h3>
-        <div id="routeDefaults"></div>
-      </div>
+      <details class="exp"><summary>Default routes &amp; routing detail <span class="hint dim small">technical</span></summary>
+        <div class="exp-body" id="routeDefaults"></div>
+      </details>
+      <details class="exp mt"><summary>Full routing table</summary>
+        <div class="exp-body" id="routeFull"></div>
+      </details>
     </section>
 
+    <!-- ================= TTL ================= -->
     <section id="view-ttl" class="view">
-      <h2>TTL / Hop limit</h2>
-      <p class="sub">The packet-header IPv4 TTL and IPv6 hop limit. These are unrelated to DNS
-        record TTLs or traceroute hop counts, which are shown separately and are not configurable
-        here. Nothing is written without an explicit preview and confirmation, and every change
-        captures the original value for restore first.</p>
-      <div class="row between">
-        <div id="ttlState" class="dim"></div>
-        <div class="row">
-          <button class="btn secondary" id="ttlReload">Reload current values</button>
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Control</div>
+          <h2>TTL / Hop limit</h2>
+          <p class="sub">The packet-header IPv4 TTL and IPv6 hop limit — unrelated to DNS record TTLs
+            or traceroute hop counts, which are shown separately and are not configurable here. Every
+            change is previewed and confirmed, captures the original for restore, and is read back.</p>
+        </div>
+        <div class="row"><button class="btn secondary" id="ttlReload">↻ Reload current values</button></div>
+      </div>
+      <div id="ttlState" class="small dim" style="margin-bottom:12px"></div>
+      <div id="ttlBody"></div>
+      <details class="exp mt"><summary>Opt-in configuration <span class="hint dim small">saved, never applied by itself</span></summary>
+        <div class="exp-body" id="ttlConfig"></div>
+      </details>
+      <details class="exp mt"><summary>Change history</summary>
+        <div class="exp-body" id="ttlHistory"></div>
+      </details>
+    </section>
+
+    <!-- ================= DIAGNOSTICS ================= -->
+    <section id="view-diag" class="view">
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Control</div>
+          <h2>Diagnostics</h2>
+          <p class="sub">Each check states what its result does and does not establish. A command that
+            exited without error is never reported as success on its own.</p>
         </div>
       </div>
-      <div id="ttlBody"></div>
-      <div class="panel">
-        <h3>Opt-in configuration <span class="hint">saved, never applied by itself</span></h3>
-        <div id="ttlConfig"></div>
-      </div>
-      <div class="panel">
-        <h3>Change history</h3>
-        <div id="ttlHistory"></div>
-      </div>
-    </section>
-
-    <section id="view-diag" class="view">
-      <h2>Diagnostics</h2>
-      <p class="sub">Each check states what its result does and does not establish. A command
-        that exited without error is never reported as success on its own.</p>
-      <div class="row between">
+      <div class="row between" style="margin-bottom:14px">
         <div class="row">
-          <button class="btn" id="diagRunAll">Run all supported checks</button>
+          <button class="btn primary" id="diagRunAll">Run all supported checks</button>
           <button class="btn secondary" id="diagRunSel">Run selected</button>
           <button class="btn secondary" id="diagCancel" disabled>Cancel</button>
         </div>
         <div class="row">
-          <button class="btn" id="exportStart">Export diagnostics for AI analysis</button>
+          <button class="btn" id="exportStart">⤓ Export for AI analysis</button>
         </div>
       </div>
-      <div id="diagProgress" class="mt"></div>
+      <div id="diagProgress" class="mt hidden"></div>
       <div id="diagResults"></div>
-      <div class="panel">
-        <h3>Available checks</h3>
-        <div id="diagChecks"></div>
-      </div>
-      <div class="panel hidden" id="exportPanel">
+      <details class="exp mt" id="diagChecksExp"><summary>Available checks</summary>
+        <div class="exp-body" id="diagChecks"></div>
+      </details>
+      <div class="panel hidden mt" id="exportPanel">
         <h3>Export preview <span class="hint">inspect before sharing; nothing is uploaded</span></h3>
         <div id="exportMeta"></div>
         <div class="row spread">
-          <button class="btn secondary" id="exportSave">Save .txt and .json</button>
-          <button class="btn secondary" id="exportCopy">Copy JSON</button>
+          <button class="btn secondary" id="exportSave">Save .txt / .json / .md</button>
+          <button class="btn secondary" id="exportCopy">Copy</button>
         </div>
         <div id="exportVisibility" class="mt"></div>
         <pre id="exportText" class="mt"></pre>
       </div>
     </section>
 
+    <!-- ================= LOGS ================= -->
     <section id="view-logs" class="view">
-      <h2>Logs</h2>
-      <p class="sub">The in-memory event history. Rotating files on disk hold the same events
-        with the level the Settings section selects.</p>
-      <div class="row">
-        <label class="field">Level
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Control</div>
+          <h2>Logs</h2>
+          <p class="sub">The in-memory event history. Rotating files on disk hold the same events with
+            the level selected in Settings. Export as .md, .txt or .json; secrets and personal data are
+            redacted.</p>
+        </div>
+      </div>
+      <div class="logtoolbar">
+        <label class="field"><span>Level</span>
           <select id="logLevel">
             <option value="debug">debug</option>
             <option value="info" selected>info</option>
@@ -144,20 +187,39 @@
             <option value="error">error</option>
           </select>
         </label>
-        <label class="field" style="flex:1;min-width:240px">Search
-          <input type="text" id="logQuery" placeholder="code, message or detail; empty = live tail">
+        <label class="field grow"><span>Search</span>
+          <input type="search" id="logQuery" placeholder="code, message or detail; empty = live tail">
+        </label>
+        <label class="field"><span>&nbsp;</span><button class="btn secondary" id="logClearSearch">Clear</button></label>
+        <label class="field"><span>&nbsp;</span>
+          <div class="row tight">
+            <button class="btn secondary" id="logCopySel">Copy selected</button>
+            <button class="btn secondary" id="logCopyAll">Copy all visible</button>
+          </div>
         </label>
         <label class="field"><span>&nbsp;</span>
-          <button class="btn secondary" id="logClearSearch">Clear</button>
+          <div class="row tight">
+            <button class="btn secondary" id="logExportMd">.md</button>
+            <button class="btn secondary" id="logExportTxt">.txt</button>
+            <button class="btn secondary" id="logExportJson">.json</button>
+          </div>
         </label>
       </div>
-      <div id="logBody" class="mt"></div>
+      <div id="logBody"></div>
     </section>
 
+    <!-- ================= SETTINGS / PROFILES ================= -->
     <section id="view-settings" class="view">
-      <h2>Settings</h2>
-      <p class="sub">Stored in a versioned file next to the application's state. Validation
-        lists every problem instead of silently keeping the good parts.</p>
+      <div class="pagehead">
+        <div>
+          <div class="crumb">Control</div>
+          <h2>Profiles &amp; Settings</h2>
+          <p class="sub">Named profiles for common use cases plus the application's own settings.
+            Selecting or editing a profile never changes live system settings on its own — it only
+            changes what the engine would be asked for next time it starts.</p>
+        </div>
+        <div class="row"><button class="btn primary" id="settingsSave">Save settings</button></div>
+      </div>
       <div id="settingsBody"></div>
     </section>
   </main>

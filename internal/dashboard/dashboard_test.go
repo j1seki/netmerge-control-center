@@ -761,6 +761,42 @@ func TestTTLRestoreCarriesTheSelectedSettings(t *testing.T) {
 	}
 }
 
+// TestTTLApplySendsStagedValuesAsOverride is the regression for a mismatch that reads as success:
+// the page staged one value while the stored config held another, and the preview reported the
+// stored config's numbers. The staged values must ride along as the operation's override.
+func TestTTLApplySendsStagedValuesAsOverride(t *testing.T) {
+	h := newHarness(t)
+	staged := map[string]any{"schema": "netmerge-ttl/1", "version": 1, "enabled": true,
+		"bumpIPv4": 255, "bumpIPv6": 128, "interfacePolicy": "none"}
+	code, _ := h.data("POST", "/api/ttl/apply", map[string]any{"dryRun": true, "config": staged})
+	if code != 200 {
+		t.Fatalf("apply with override = %d", code)
+	}
+	h.ttl.mu.Lock()
+	defer h.ttl.mu.Unlock()
+	if len(h.ttl.applyReq) != 1 || h.ttl.applyReq[0].Override == nil {
+		t.Fatalf("the staged config did not reach the manager as an override: %+v", h.ttl.applyReq)
+	}
+	if h.ttl.applyReq[0].Override.BumpIPv4 != 255 || h.ttl.applyReq[0].Override.BumpIPv6 != 128 {
+		t.Errorf("override = %+v, want bumpIPv4=255 bumpIPv6=128", h.ttl.applyReq[0].Override)
+	}
+	// The override is for this operation only: it must never be written to disk as the config.
+	if len(h.ttl.saved) != 0 {
+		t.Errorf("an apply wrote a configuration to disk: %+v", h.ttl.saved)
+	}
+}
+
+// A malformed override is refused with a clear code rather than reaching the manager.
+func TestTTLApplyRejectsInvalidOverride(t *testing.T) {
+	h := newHarness(t)
+	bad := map[string]any{"schema": "netmerge-ttl/1", "version": 1, "enabled": true,
+		"bumpIPv4": 999999, "bumpIPv6": 128, "interfacePolicy": "none"}
+	code, errCode := h.errCode("POST", "/api/ttl/apply", map[string]any{"dryRun": true, "config": bad})
+	if code != http.StatusBadRequest || errCode != "dashboard_ttl_config_invalid" {
+		t.Errorf("invalid override = %d/%s", code, errCode)
+	}
+}
+
 func TestExportRendersRedactedArtifacts(t *testing.T) {
 	h := newHarness(t)
 	// Produce a diagnostics result first: the export includes the last completed run.
@@ -833,10 +869,14 @@ func TestExportRendersRedactedArtifacts(t *testing.T) {
 		t.Fatalf("save = %d", code)
 	}
 	paths, _ := saved["saved"].([]any)
-	if len(paths) != 2 {
-		t.Fatalf("saved = %v", saved["saved"])
+	if len(paths) != 3 {
+		t.Fatalf("saved = %v (the .txt, .md and .json renderings should all be written)", saved["saved"])
 	}
+	var sawMD bool
 	for _, p := range paths {
+		if strings.HasSuffix(p.(string), ".md") {
+			sawMD = true
+		}
 		b, err := os.ReadFile(p.(string))
 		if err != nil {
 			t.Fatalf("reading %s: %v", p, err)
@@ -848,10 +888,13 @@ func TestExportRendersRedactedArtifacts(t *testing.T) {
 			t.Errorf("the saved file %s contains the visibility mapping", p)
 		}
 	}
+	if !sawMD {
+		t.Errorf("no Markdown report was saved: %v", paths)
+	}
 	// And the job now reports where they went.
 	after := waitJob(t, h, "/api/export/"+id)
 	e2, _ := after["export"].(map[string]any)
-	if got, _ := e2["saved"].([]any); len(got) != 2 {
+	if got, _ := e2["saved"].([]any); len(got) != 3 {
 		t.Errorf("the job does not report the saved paths: %v", e2["saved"])
 	}
 }

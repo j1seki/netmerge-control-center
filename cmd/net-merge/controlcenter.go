@@ -372,8 +372,12 @@ func cmdDiag(args []string) {
 			fmt.Fprintf(os.Stderr, "net-merge: %v\n", err)
 			os.Exit(1)
 		}
-		txt, js := bundle.WriteName(*exportDir)
+		txt, md, js := bundle.WriteName(*exportDir)
 		if err := os.WriteFile(txt, bundle.Text, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "net-merge: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(md, bundle.Markdown, 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "net-merge: %v\n", err)
 			os.Exit(1)
 		}
@@ -381,7 +385,7 @@ func cmdDiag(args []string) {
 			fmt.Fprintf(os.Stderr, "net-merge: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("\nreport written (already redacted):\n  %s\n  %s\n", txt, js)
+		fmt.Printf("\nreport written (already redacted):\n  %s\n  %s\n  %s\n", txt, md, js)
 		fmt.Printf("redacted %d value(s). The placeholder-to-value mapping is shown here and is NOT in the files:\n", bundle.Counts.Total)
 		printEntries(bundle.Entries)
 	}

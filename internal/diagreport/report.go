@@ -302,9 +302,12 @@ func caveats(o Options, run diag.RunResult) []string {
 type Bundle struct {
 	// BaseName is the suggested file name without an extension.
 	BaseName string
-	// JSON and Text are the renderings, redacted.
-	JSON []byte
-	Text []byte
+	// JSON, Text and Markdown are the three renderings, all redacted. Markdown is derived from
+	// the same Text body rather than re-read from the document, so the three files can never
+	// disagree about a fact.
+	JSON     []byte
+	Text     []byte
+	Markdown []byte
 	// Counts describes what was removed from the exported bytes.
 	Counts RedactionCounts
 	// Entries is the mapping shown to the user on their own terminal. It is deliberately not
@@ -337,15 +340,18 @@ func (d *Document) Bundle(p Policy) (Bundle, error) {
 		BaseName: "net-merge-diagnostics-" + d.Generated.Format("20060102-150405"),
 		JSON:     []byte(r.String(string(finalJSON))),
 		Text:     []byte(r.String(d.Text())),
+		Markdown: []byte(r.String(d.Markdown())),
 		Entries:  r.Entries(),
 	}
 	b.Counts = r.Counts()
 	return b, nil
 }
 
-// WriteName returns the two file names a bundle should be written under.
-func (b Bundle) WriteName(dir string) (txt, js string) {
-	return filepath.Join(dir, b.BaseName+".txt"), filepath.Join(dir, b.BaseName+".json")
+// WriteName returns the three file names a bundle should be written under.
+func (b Bundle) WriteName(dir string) (txt, md, js string) {
+	return filepath.Join(dir, b.BaseName+".txt"),
+		filepath.Join(dir, b.BaseName+".md"),
+		filepath.Join(dir, b.BaseName+".json")
 }
 
 // Text renders the human- and model-readable form. It is built to be read top to bottom by
@@ -665,6 +671,119 @@ func (d *Document) Text() string {
 	}
 
 	w("\nend of report\n")
+	return b.String()
+}
+
+// Markdown renders the report as a Markdown document. It transforms the plain-text rendering
+// instead of re-deriving the facts from the document, so a section that exists in one artifact
+// exists in the other with the same wording: the two formats cannot drift apart.
+//
+// The transformation is deliberately conservative - headings, bullets and key/value pairs are
+// recognised, and anything else is passed through as prose with Markdown's own starters
+// escaped, so a line that happens to begin with "#" stays a line of text.
+func (d *Document) Markdown() string {
+	return textToMarkdown(d.Text())
+}
+
+func textToMarkdown(s string) string {
+	// Each source line becomes a block of a known kind, so the join step can guarantee the
+	// blank lines Markdown needs around prose: without them a paragraph after a bullet is
+	// swallowed as the bullet's lazy continuation and the report reads wrong.
+	const (
+		blkBlank = iota
+		blkHead
+		blkItem
+		blkPara
+	)
+	var (
+		kinds []int
+		texts []string
+	)
+	first := true
+	for _, raw := range strings.Split(s, "\n") {
+		line := strings.TrimRight(raw, " \t")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(kinds) > 0 && kinds[len(kinds)-1] != blkBlank {
+				kinds, texts = append(kinds, blkBlank), append(texts, "")
+			}
+			continue
+		}
+		switch {
+		case first:
+			// The document's opening line becomes the title.
+			kinds, texts = append(kinds, blkHead), append(texts, "# "+trimmed)
+			first = false
+		case strings.HasPrefix(line, "== ") && strings.HasSuffix(line, " =="):
+			title := strings.TrimSuffix(strings.TrimPrefix(line, "== "), " ==")
+			kinds, texts = append(kinds, blkHead), append(texts, "## "+title)
+		case strings.HasPrefix(line, "- "):
+			kinds, texts = append(kinds, blkItem), append(texts, mdEscape(line))
+		case mdKeyValue(line):
+			k, v, _ := strings.Cut(line, ":")
+			kinds, texts = append(kinds, blkItem),
+				append(texts, "- **"+mdEscape(strings.TrimSpace(k))+":** "+mdEscape(strings.TrimSpace(v)))
+		default:
+			kinds, texts = append(kinds, blkPara), append(texts, mdEscape(line))
+		}
+	}
+
+	var out []string
+	for i, t := range texts {
+		k := kinds[i]
+		switch k {
+		case blkHead, blkPara:
+			if i > 0 && kinds[i-1] != blkBlank {
+				out = append(out, "")
+			}
+			out = append(out, t)
+			// A paragraph must be closed by a blank line before whatever follows it.
+			if k == blkPara && i+1 < len(kinds) && kinds[i+1] != blkBlank {
+				out = append(out, "")
+			}
+		case blkBlank:
+			out = append(out, "")
+		default:
+			out = append(out, t)
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n")) + "\n"
+}
+
+// mdKeyValue reports whether a line is a "key: value" fact rather than a sentence. The key
+// must be short and free of sentence punctuation, which keeps prose lines out of the bullet
+// form they would read badly in.
+func mdKeyValue(line string) bool {
+	k, v, ok := strings.Cut(line, ":")
+	if !ok || strings.TrimSpace(v) == "" {
+		return false
+	}
+	k = strings.TrimSpace(k)
+	if k == "" || len(k) > 64 {
+		return false
+	}
+	return !strings.ContainsAny(k, ".!?;")
+}
+
+// mdEscape keeps Markdown from reinterpreting report text: a leading heading or list marker
+// is neutralised, and the inline characters that would otherwise become emphasis or a link
+// are backslash-escaped when they appear.
+func mdEscape(s string) string {
+	if strings.HasPrefix(s, "#") || strings.HasPrefix(s, ">") {
+		s = "\\" + s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '*', '_', '[', ']', '`':
+			// Escape only when it could start markup, which keeps ordinary text readable.
+			if i == 0 || s[i-1] != '\\' {
+				b.WriteByte('\\')
+			}
+		}
+		b.WriteByte(c)
+	}
 	return b.String()
 }
 

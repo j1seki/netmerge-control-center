@@ -309,16 +309,22 @@ func TestTextCarriesTheSectionsAndTheDistinctions(t *testing.T) {
 	}
 }
 
-func TestBundleRedactsBothArtifacts(t *testing.T) {
+func TestBundleRedactsAllArtifacts(t *testing.T) {
 	doc := testDoc(t)
 	b, err := doc.Bundle(DefaultPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
-	js, txt := string(b.JSON), string(b.Text)
+	js, txt, md := string(b.JSON), string(b.Text), string(b.Markdown)
 
+	if len(md) == 0 {
+		t.Fatalf("the Markdown rendering is empty")
+	}
 	if !strings.Contains(js, "[ip#1]") {
 		t.Errorf("the JSON should carry a placeholder for the public address, got:\n%s", firstLines(js, 40))
+	}
+	if !strings.Contains(md, "[ip#1]") {
+		t.Errorf("the Markdown should carry the same placeholder as the text, got:\n%s", firstLines(md, 40))
 	}
 	for _, leak := range []string{"93.184.216.34", "1a:2b:3c", "alex.smith"} {
 		if strings.Contains(js, leak) {
@@ -326,6 +332,9 @@ func TestBundleRedactsBothArtifacts(t *testing.T) {
 		}
 		if strings.Contains(txt, leak) {
 			t.Errorf("the text still contains %q", leak)
+		}
+		if strings.Contains(md, leak) {
+			t.Errorf("the Markdown still contains %q", leak)
 		}
 	}
 	// The MAC keeps its vendor part, so the report stays diagnostically useful.
@@ -346,12 +355,12 @@ func TestBundleRedactsBothArtifacts(t *testing.T) {
 	if doc.Redaction.MACAddresses != 2 {
 		t.Errorf("MACAddresses = %d, want 2 (both adapters)", doc.Redaction.MACAddresses)
 	}
-	// The mapping that names the values is for the generating user's terminal, never for the file.
+	// The mapping that names the values is for the generating user's terminal, never for a file.
 	for _, e := range b.Entries {
 		if e.Value == "" {
 			continue
 		}
-		if strings.Contains(js, e.Value) || strings.Contains(txt, e.Value) {
+		if strings.Contains(js, e.Value) || strings.Contains(txt, e.Value) || strings.Contains(md, e.Value) {
 			t.Errorf("the exported artifacts contain the original %s %q that redaction was supposed to hold back", e.Category, e.Value)
 		}
 	}
@@ -372,6 +381,9 @@ func TestBundleIsDeterministic(t *testing.T) {
 	}
 	if !bytes.Equal(b1.Text, b2.Text) {
 		t.Errorf("two renders of the same document produced different text")
+	}
+	if !bytes.Equal(b1.Markdown, b2.Markdown) {
+		t.Errorf("two renders of the same document produced different Markdown")
 	}
 	if b1.BaseName != b2.BaseName {
 		t.Errorf("base name changed between renders: %q vs %q", b1.BaseName, b2.BaseName)
@@ -406,15 +418,83 @@ func TestWriteName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	txt, js := b.WriteName("/tmp/exports")
+	txt, md, js := b.WriteName("/tmp/exports")
 	if filepath.Base(txt) != b.BaseName+".txt" {
 		t.Errorf("text name = %q", txt)
+	}
+	if filepath.Base(md) != b.BaseName+".md" {
+		t.Errorf("markdown name = %q", md)
 	}
 	if filepath.Base(js) != b.BaseName+".json" {
 		t.Errorf("json name = %q", js)
 	}
 	if !strings.Contains(b.BaseName, "net-merge-diagnostics-") {
 		t.Errorf("base name = %q", b.BaseName)
+	}
+}
+
+// TestMarkdownMirrorsTheTextReport keeps the two renderings honest about the same facts: every
+// section the plain-text report has must exist in the Markdown one, with the same wording, and
+// the Markdown must be structurally valid (title, headings, no leftover "==" markers, and prose
+// separated from lists so nothing is swallowed as a bullet's continuation).
+func TestMarkdownMirrorsTheTextReport(t *testing.T) {
+	doc := testDoc(t)
+	b, err := doc.Bundle(DefaultPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, md := string(b.Text), string(b.Markdown)
+
+	if md == "" {
+		t.Fatalf("Markdown rendering is empty")
+	}
+	if !strings.HasPrefix(md, "# net-merge diagnostic report\n") {
+		t.Errorf("the report should open with a level-1 title, got:\n%s", firstLines(md, 3))
+	}
+	if strings.Contains(md, "== ") {
+		t.Errorf("plain-text section markers leaked into the Markdown:\n%s", firstLines(md, 40))
+	}
+
+	// Section parity: every "== X ==" in the text must be a "## X" heading in the Markdown.
+	var sections []string
+	for _, line := range strings.Split(text, "\n") {
+		if title, ok := strings.CutPrefix(strings.TrimSpace(line), "== "); ok {
+			if title, ok := strings.CutSuffix(title, " =="); ok {
+				sections = append(sections, title)
+			}
+		}
+	}
+	if len(sections) == 0 {
+		t.Fatalf("the plain-text report has no sections, so parity is untestable")
+	}
+	for _, s := range sections {
+		if !strings.Contains(md, "## "+s+"\n") {
+			t.Errorf("section %q is in the text report but missing as a Markdown heading", s)
+		}
+	}
+
+	// No line that is prose may sit directly under a bullet, and no bullet under a paragraph
+	// without the blank line CommonMark needs to tell them apart.
+	lines := strings.Split(md, "\n")
+	for i := 1; i < len(lines); i++ {
+		prev, cur := lines[i-1], lines[i]
+		if prev == "" || cur == "" {
+			continue
+		}
+		prevItem, curItem := strings.HasPrefix(prev, "- "), strings.HasPrefix(cur, "- ")
+		if prevItem && !curItem && !strings.HasPrefix(cur, "#") {
+			t.Errorf("line %d (%q) follows a bullet with no blank line; it would be read as the bullet's continuation", i+1, cur)
+		}
+		if !prevItem && !strings.HasPrefix(prev, "#") && curItem {
+			t.Errorf("line %d (%q) starts a list directly under prose with no blank line", i+1, cur)
+		}
+	}
+
+	// A heading must never be glued to the line above it.
+	for i, line := range lines {
+		if strings.HasPrefix(line, "#") && i > 0 && lines[i-1] != "" {
+			t.Errorf("heading %q is not preceded by a blank line", line)
+		}
 	}
 }
 

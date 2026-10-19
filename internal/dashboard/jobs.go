@@ -27,12 +27,13 @@ const (
 	JobCancelled = "cancelled"
 )
 
-// exportResult is what an export job produces: the two rendered artifacts plus what was
-// redacted. Entries is the placeholder-to-value mapping; it is deliberately not part of either
+// exportResult is what an export job produces: the three rendered artifacts plus what was
+// redacted. Entries is the placeholder-to-value mapping; it is deliberately not part of any
 // artifact and must never be written to a file.
 type exportResult struct {
 	BaseName string                     `json:"baseName"`
 	Text     string                     `json:"text"`
+	Markdown string                     `json:"markdown"`
 	JSON     string                     `json:"json"`
 	Counts   diagreport.RedactionCounts `json:"redactionCounts"`
 	Entries  []diagreport.Entry         `json:"redactionEntries"`

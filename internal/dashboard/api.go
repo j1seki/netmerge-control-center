@@ -321,6 +321,14 @@ type ttlOpRequest struct {
 	Confirm bool     `json:"confirm"`
 	Reason  string   `json:"reason"`
 	Only    []string `json:"only,omitempty"`
+
+	// Config, when non-nil, is the configuration this one operation should act on. The page
+	// sends the values the user staged on screen, so the preview reports exactly what they
+	// chose rather than whatever was last saved - a staged target that was never saved must
+	// not be silently substituted by a stale config, and an apply must never write a value
+	// the preview did not show. The override lives for this operation only: it is never
+	// written to disk, so a preview leaves no trace and a saved config is not mutated.
+	Config *ttlmgr.Config `json:"config,omitempty"`
 }
 
 func (s *Server) handleTTLApply(w http.ResponseWriter, r *http.Request) {
@@ -367,9 +375,20 @@ func (s *Server) ttlOp(w http.ResponseWriter, r *http.Request, restore bool) {
 			Ifaces: s.ifaces(), DryRun: req.DryRun, Confirm: req.Confirm, Reason: reason, Only: only,
 		})
 	} else {
-		out, err = s.deps.TTL.Apply(ctx, ttlmgr.ApplyRequest{
+		applyReq := ttlmgr.ApplyRequest{
 			Ifaces: s.ifaces(), DryRun: req.DryRun, Confirm: req.Confirm, Reason: reason,
-		})
+		}
+		if req.Config != nil {
+			// Validate the override rather than trusting the page: a bad value must come back
+			// as a refusal, not as a surprise write.
+			if err := req.Config.Validate(); err != nil {
+				fail(w, http.StatusBadRequest, "dashboard_ttl_config_invalid",
+					"the configuration sent with this operation was rejected", err.Error())
+				return
+			}
+			applyReq.Override = req.Config
+		}
+		out, err = s.deps.TTL.Apply(ctx, applyReq)
 	}
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "dashboard_ttl_op_failed", "the TTL operation did not complete", err.Error())
