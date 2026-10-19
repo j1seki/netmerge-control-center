@@ -169,6 +169,22 @@ jobs:
         run: |
           GOOS=windows GOARCH=amd64 go vet ./...
           GOOS=windows GOARCH=arm64 go vet ./...
+      - name: Fetch wintun.dll (the Windows TUN driver; not stored in the repo)
+        shell: bash
+        run: |
+          # The engine loads wintun.dll from next to net-merge.exe at runtime, so the portable
+          # zip must carry it or Windows-only runs fail with tun_driver_missing. Same URL and
+          # digest as scripts/fetch-wintun.ps1 and docs/RELEASING.md — keep those in step.
+          # That script's Authenticode check needs Windows tooling, so on this runner the digest
+          # is what is verified; nothing is published unless it matches.
+          mkdir -p dist wintun-x
+          curl -fsSL https://www.wintun.net/builds/wintun-0.14.1.zip -o wintun.zip
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  wintun.zip" | sha256sum -c -
+          unzip -q -j wintun.zip 'wintun/bin/amd64/wintun.dll' 'wintun/LICENSE.txt' -d wintun-x/
+          # Renamed on the way in, so the driver's license can never overwrite the project's
+          # LICENSE, which the build step copies into the same directory.
+          cp wintun-x/wintun.dll dist/wintun.dll
+          cp wintun-x/LICENSE.txt dist/wintun-LICENSE.txt
       - name: Build amd64 binaries
         shell: bash
         env:
@@ -181,7 +197,7 @@ jobs:
           cp LICENSE THIRD-PARTY-NOTICES.md dist/
           (
             cd dist
-            zip -9 ../dist/net-merge-windows-amd64.zip net-merge.exe net-merge-tray.exe LICENSE THIRD-PARTY-NOTICES.md
+            zip -9 ../dist/net-merge-windows-amd64.zip net-merge.exe net-merge-tray.exe wintun.dll wintun-LICENSE.txt LICENSE THIRD-PARTY-NOTICES.md
           )
       - name: Upload amd64
         uses: actions/upload-artifact@v4
@@ -263,7 +279,7 @@ jobs:
           Portable binaries built by the `build` workflow. Nothing here is code-signed.
 
           **A GUI on every OS:**
-          * **Windows** — `net-merge-tray.exe` (windowless tray; double-click it). `net-merge.exe` is the plain CLI.
+          * **Windows** — `net-merge-tray.exe` (windowless tray; double-click it). `net-merge.exe` is the plain CLI. The portable zip also contains `wintun.dll` and `wintun-LICENSE.txt`; keep them next to the exes so the bonding engine can load the driver.
           * **Linux** — `net-merge-x86_64.AppImage` opens the **Control Center dashboard** in your browser (no system tray required). To actually bond, start the privileged engine first with `sudo "./net-merge-x86_64.AppImage" run`; the dashboard then turns it on and off. Run `./net-merge-x86_64.AppImage <subcommand>` for the CLI. The AppImage itself needs FUSE (libfuse2) on most distros.
           * **macOS** — the universal binary opens the tray when run with no arguments. Pass a subcommand for the CLI. Ad-hoc signed only; on first run use *System Settings → Privacy & Security → Open Anyway*.
 
