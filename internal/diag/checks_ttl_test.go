@@ -59,7 +59,7 @@ func TestTTLCheckReportsSettingsCapturesAndInterfaces(t *testing.T) {
 		gotIfaces = ifaces
 		return ttlmgr.Report{
 			Capabilities: ttlmgr.Capabilities{
-				Platform: "windows", Supported: true,
+				Platform: "windows", Supported: true, Readable: true,
 				Notes: []string{"packet-header values only; DNS record TTLs are a different concept"},
 			},
 			Settings: []ttlmgr.Setting{
@@ -149,7 +149,7 @@ func TestTTLCheckWarnsOnPartialRead(t *testing.T) {
 	env.IsAdmin = false
 	env.InspectTTL = func(context.Context, []ttlmgr.IfaceInfo) (ttlmgr.Report, error) {
 		return ttlmgr.Report{
-			Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true},
+			Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true, Readable: true},
 			ReadErrors: []ttlmgr.ReadFailure{{
 				Setting: ttlmgr.SettingRef{
 					ID:   ttlmgr.InterfaceSettingID(ttlmgr.FamilyIPv6, 7, "Wi-Fi"),
@@ -227,7 +227,7 @@ func TestTTLCheckDoesNotActOnEnabledConfig(t *testing.T) {
 	v4 := 128
 	env.InspectTTL = func(context.Context, []ttlmgr.IfaceInfo) (ttlmgr.Report, error) {
 		return ttlmgr.Report{
-			Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true},
+			Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true, Readable: true},
 			Settings: []ttlmgr.Setting{{
 				SettingRef: ttlmgr.SettingRef{ID: ttlmgr.IDv4Default, Kind: ttlmgr.KindPacketTTL, Family: ttlmgr.FamilyIPv4, Scope: ttlmgr.ScopeSystemGlobal},
 				Value:      &v4, ValueOrigin: "cmdlet", Writable: true,
@@ -264,7 +264,7 @@ func TestTTLCheckRunsWithoutInventory(t *testing.T) {
 		if len(ifaces) != 0 {
 			t.Errorf("no inventory source should mean no interfaces, got %+v", ifaces)
 		}
-		return ttlmgr.Report{Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true}}, nil
+		return ttlmgr.Report{Capabilities: ttlmgr.Capabilities{Platform: "windows", Supported: true, Readable: true}}, nil
 	}
 	res := runOne(t, env, "ttl.inspect")
 	if !called {

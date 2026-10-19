@@ -126,23 +126,31 @@ func (m *Manager) Inspect(ctx context.Context, ifaces []IfaceInfo) (Report, erro
 	}
 	rep.Captured = orig.ByID()
 
+	// Inspection reads whenever the host can produce a value, even if it cannot change one:
+	// a Linux/macOS host reports the real current TTL / hop limit rather than an unhelpful
+	// "default". Writing is gated separately on Supported, so a read-only host is never
+	// presented as able to change anything.
 	refs := SettingRefs(ifaces)
+	if !rep.Capabilities.Readable {
+		reason := "This host exposes no readable source for the current value."
+		if !rep.Capabilities.Supported {
+			reason = "This host has no supported mechanism for this setting."
+		}
+		for _, ref := range refs {
+			rep.Settings = append(rep.Settings, Setting{
+				SettingRef:     ref,
+				Writable:       false,
+				WritableReason: reason,
+			})
+		}
+		return rep, nil
+	}
+
 	for _, ref := range refs {
 		setting := Setting{
 			SettingRef:     ref,
 			Writable:       false,
 			WritableReason: "",
-		}
-		if !rep.Capabilities.Supported {
-			setting.WritableReason = "This host has no supported mechanism for this setting."
-			rep.Settings = append(rep.Settings, setting)
-			continue
-		}
-		if ref.Scope == ScopePerInterface && !capabilitiesAllowPerInterface(rep.Capabilities) {
-			setting.WritableReason = "Set-NetIPInterface -CurrentHopLimit is not available on this Windows build, " +
-				"so a per-interface value cannot be set through a supported mechanism."
-			rep.Settings = append(rep.Settings, setting)
-			continue
 		}
 		obs, err := m.backend.Read(ctx, ref)
 		if err != nil {
@@ -153,10 +161,34 @@ func (m *Manager) Inspect(ctx context.Context, ifaces []IfaceInfo) (Report, erro
 		}
 		setting.Value = obs.Value
 		setting.ValueOrigin = obs.Origin
-		setting.Writable = true
+		// Writability is decided by the host's write capability, never by a successful read.
+		if !rep.Capabilities.Supported {
+			setting.WritableReason = readOnlyReason(rep.Capabilities.Platform)
+		} else if ref.Scope == ScopePerInterface && !capabilitiesAllowPerInterface(rep.Capabilities) {
+			setting.WritableReason = "Set-NetIPInterface -CurrentHopLimit is not available on this Windows build, " +
+				"so a per-interface value cannot be set through a supported mechanism."
+		} else {
+			setting.Writable = true
+		}
 		rep.Settings = append(rep.Settings, setting)
 	}
 	return rep, nil
+}
+
+// readOnlyReason states, per platform, why a value that was successfully read still cannot be
+// changed here. The wording is shown next to the value, so it names the setting's blast radius
+// rather than blaming the user.
+func readOnlyReason(platform string) string {
+	switch platform {
+	case "linux":
+		return "The current value is readable from this Linux host, but changing IPv4 TTL / IPv6 " +
+			"hop limit is a Windows feature in this build; no change was attempted."
+	case "darwin":
+		return "The current value is readable from this macOS host, but changing IPv4 TTL / IPv6 " +
+			"hop limit is a Windows feature in this build; no change was attempted."
+	default:
+		return "The current value is readable, but this host has no supported write mechanism."
+	}
 }
 
 // capabilitiesAllowPerInterface reports whether the probed build supports the per-interface

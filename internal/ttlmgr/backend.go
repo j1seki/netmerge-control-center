@@ -74,6 +74,9 @@ func (u *UnsupportedBackend) Capabilities(context.Context) Capabilities {
 	return Capabilities{
 		Platform:  u.Platform,
 		Supported: false,
+		// Readable is false: with no mechanism there is nothing to read, so inspection is
+		// refused honestly rather than reporting an unhelpful "default" placeholder.
+		Readable: false,
 		Notes: []string{
 			u.Reason,
 			"IPv4 packet TTL and IPv6 hop limit are Windows settings. On this host they were not " +

@@ -255,6 +255,9 @@ func cmdDashboard(args []string) {
 		TTL:      ttlAPI{m: cc.manager, s: cc.store},
 		Diag:     cc.registry,
 		Logs:     logxReader{},
+		// Public-IP resolution is opt-in (a POST from the "Check public IPs" button) and asks a
+		// disclosed echo service over a socket pinned to each uplink; it never runs on load.
+		PublicIP: &dashboard.EchoPublicIP{},
 	}
 	if health != nil {
 		deps.Health = health

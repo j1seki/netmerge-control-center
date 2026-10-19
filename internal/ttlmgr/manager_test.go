@@ -50,6 +50,7 @@ func newFakeBackend() *fakeBackend {
 		caps: Capabilities{
 			Platform:  "test-simulation",
 			Supported: true,
+			Readable:  true,
 			Commands: []CommandCapability{
 				{Command: "Set-NetIPInterface", Parameter: "CurrentHopLimit", Present: true, HasParam: true},
 			},

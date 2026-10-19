@@ -141,6 +141,12 @@ type Privacy struct {
 	KeepWellKnownPublicIPs bool `json:"keepWellKnownPublicIPs"`
 	// IncludeHostname leaves the machine name in the report when true.
 	IncludeHostname bool `json:"includeHostname"`
+	// PublicIPEcho is the endpoint asked, only on an explicit "Check public IPs" action, what
+	// public address each uplink uses. It must be an http(s) URL returning a bare IP. Empty
+	// means the build's default. This is disclosed in the UI because a request to a third-party
+	// echo service reveals the caller's public IP to that service, which is a fact the user is
+	// entitled to see and change before it happens.
+	PublicIPEcho string `json:"publicIpEcho,omitempty"`
 }
 
 // Diagnostics configures the diagnostic center's targets and limits.

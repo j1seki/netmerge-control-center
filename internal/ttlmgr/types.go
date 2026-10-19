@@ -261,8 +261,16 @@ type Capabilities struct {
 	// Platform is runtime.GOOS, carried so reports are self-describing.
 	Platform string `json:"platform"`
 
-	// Supported is false when this host has no mechanism for the setting at all.
+	// Supported is false when this host has no mechanism for the setting at all. It is the
+	// write gate: a host can be readable without being writable, which is exactly the case on
+	// Linux and macOS, where the current values are readable from the OS but this package
+	// deliberately refuses to change them.
 	Supported bool `json:"supported"`
+
+	// Readable reports whether the current values can be read on this host at all, independent
+	// of whether they can be written. Inspection runs whenever this is true, so a read-only
+	// host still shows the real current TTL / hop limit instead of an unhelpful "default".
+	Readable bool `json:"readable"`
 
 	// Commands lists the inspected command capabilities, keyed by command name.
 	Commands []CommandCapability `json:"commands,omitempty"`

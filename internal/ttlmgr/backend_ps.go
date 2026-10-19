@@ -150,6 +150,11 @@ func (w *WindowsBackend) Capabilities(ctx context.Context) Capabilities {
 		}
 		return false
 	}
+	// Reads need only the getter cmdlets, a weaker condition than the write gate below. On a
+	// build that can read but not write, inspection still shows the real current values while
+	// every change stays refused.
+	caps.Readable = has("Get-NetIPv4Protocol") && has("Get-NetIPv6Protocol")
+
 	var missing []string
 	for _, c := range requiredCommands() {
 		if has(c.Command) {
@@ -177,7 +182,11 @@ func (w *WindowsBackend) Capabilities(ctx context.Context) Capabilities {
 		caps.Notes = append(caps.Notes,
 			"The NetTCPIP cmdlets needed for these settings are not all available on this build: "+strings.Join(missing, ", "),
 			"Nothing was read or changed. On a build without them these settings can only be inspected manually.")
-		return caps
+		// A build missing the getter cmdlets cannot be read either, so inspection is refused
+		// honestly rather than reporting values it never fetched.
+		if !caps.Readable {
+			return caps
+		}
 	}
 
 	caps.Notes = append(caps.Notes,

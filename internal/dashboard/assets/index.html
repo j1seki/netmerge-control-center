@@ -75,9 +75,14 @@
         </div>
         <div class="row">
           <button class="btn secondary" id="connRefresh">Take a fresh snapshot</button>
+          <button class="btn secondary" id="pubIPCheck"
+            title="Ask a public echo service what address each uplink uses. Runs only when clicked.">Check public IPs</button>
+          <button class="btn ghost" id="pubIPMask" aria-pressed="false"
+            title="Hide public IPs so a screen recording does not show them.">Show masked</button>
         </div>
       </div>
       <div id="connCount" class="small dim" style="margin-bottom:12px"></div>
+      <div id="pubIPNote"></div>
       <div id="connBody"></div>
     </section>
 

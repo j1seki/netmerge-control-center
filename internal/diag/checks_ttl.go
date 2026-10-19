@@ -51,12 +51,19 @@ func checkTTLInspect() Check {
 			res := Result{}
 			res.Established = append(res.Established,
 				fmt.Sprintf("the platform %s a mechanism for these settings", supportedWord(rep.Capabilities.Supported)))
+			if rep.Capabilities.Readable && !rep.Capabilities.Supported {
+				res.Established = append(res.Established,
+					"the current values are readable on this platform, but changing them is not supported here")
+			}
 			for _, note := range rep.Capabilities.Notes {
 				res.Established = append(res.Established, "capability note: "+note)
 			}
-			if rep.Capabilities.Supported {
+			switch {
+			case rep.Capabilities.Supported:
 				res.Items = append(res.Items, Item{Code: "ttl_supported"})
-			} else {
+			case rep.Capabilities.Readable:
+				res.Items = append(res.Items, Item{Code: "ttl_readable"})
+			default:
 				res.Items = append(res.Items, Item{Code: "ttl_unsupported"})
 			}
 
@@ -115,10 +122,22 @@ func checkTTLInspect() Check {
 				res.Established = append(res.Established, "elevation: "+nonEmpty(rep.Elevation, "not elevated"))
 			}
 
+			partial := res.Status == StatusWarn
 			switch {
+			case !rep.Capabilities.Readable:
+				res.Status = StatusInfo
+				if rep.Capabilities.Supported {
+					res.Summary = "this platform reports no readable source for the packet-header values; nothing is read and nothing is changed"
+				} else {
+					res.Summary = "this platform has no supported mechanism for the packet-header values; nothing is read and nothing is changed"
+				}
 			case !rep.Capabilities.Supported:
 				res.Status = StatusInfo
-				res.Summary = "this platform has no supported mechanism for the packet-header values; nothing is read and nothing is changed"
+				if partial {
+					res.Summary = "the packet-header values are readable on this platform, but some could not be read and changing them is not supported here"
+				} else {
+					res.Summary = fmt.Sprintf("IPv4 TTL and IPv6 hop limit read for %d setting(s); changing them is not supported on this platform", len(rep.Settings))
+				}
 			case res.Status == StatusWarn:
 				res.Summary = "the packet-header values were partly read; the settings that failed are listed"
 			default:

@@ -120,6 +120,11 @@ type Deps struct {
 	Logs     LogsReader
 	Health   HealthChecker
 
+	// PublicIP resolves one uplink's public address by asking a disclosed echo service over a
+	// socket pinned to that uplink. It is nil unless wired, and the endpoint that uses it says
+	// so rather than reporting an empty result that would look like "no public IP".
+	PublicIP PublicIPProbe
+
 	// Now is injectable for tests. Defaults to time.Now.
 	Now func() time.Time
 }
@@ -584,6 +589,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/ttl/config", s.handleTTLConfig)
 	mux.HandleFunc("POST /api/ttl/apply", s.handleTTLApply)
 	mux.HandleFunc("POST /api/ttl/restore", s.handleTTLRestore)
+	mux.HandleFunc("POST /api/uplinks/publicip", s.handlePublicIPCheck)
 	mux.HandleFunc("GET /api/diag/checks", s.handleDiagChecks)
 	mux.HandleFunc("POST /api/diag/run", s.handleDiagRun)
 	mux.HandleFunc("GET /api/diag/runs", s.handleDiagRuns)

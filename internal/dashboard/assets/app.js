@@ -200,6 +200,13 @@ let state = null;
 let settingsView = null;
 let ttlReport = null;
 let openAdapters = new Set();
+// publicIP is the last opt-in public-IP check: {endpoint, at, results, skipped}. It stays null
+// until the user clicks "Check public IPs" — nothing here runs on load or on a poll.
+let publicIP = null;
+// publicIPMasked hides the addresses behind a placeholder. It is persisted so a page reload
+// mid-recording does not silently reveal them again.
+let publicIPMasked = false;
+try { publicIPMasked = localStorage.getItem("netmerge.pubip.masked") === "1"; } catch (e) { publicIPMasked = false; }
 let logCursor = 0;
 let logTimer = null;
 let logSelected = new Set();
@@ -508,6 +515,60 @@ function kindChip(a) {
   return h("span", { class: "kind-ic " + cls, title: label }, ic);
 }
 
+/* ---------- public IPs (opt-in, masked for recording) ---------- */
+
+// maskIP replaces the host part of an address with a placeholder so a screen recording shows
+// that a public IP exists without showing the address itself. The network prefix is kept so the
+// card still reads as a real answer; only the routable host is hidden.
+function maskIP(ip) {
+  if (!publicIPMasked || !ip) return ip;
+  if (ip.indexOf(".") >= 0) {
+    const p = ip.split(".");
+    if (p.length === 4) return p[0] + "." + p[1] + "." + p[2] + ".•••";
+    return "•••.•••.•••.•••";
+  }
+  if (ip.indexOf(":") >= 0) {
+    const parts = ip.split(":");
+    return parts.slice(0, 3).join(":") + ":•••";
+  }
+  return "•••";
+}
+
+// publicIPFor returns the last check's result for one adapter, or null when the adapter was
+// not asked (or no check has run yet).
+function publicIPFor(name) {
+  if (!publicIP || !publicIP.results) return null;
+  return publicIP.results.find((r) => r.name === name) || null;
+}
+
+// checkPublicIPs is the opt-in action. It makes one HTTPS request per uplink to a disclosed
+// echo service, pinned to that uplink's socket, and only ever runs when this button is clicked.
+async function checkPublicIPs(btn) {
+  const d = await guard(() => api("/api/uplinks/publicip", { method: "POST" }), btn);
+  if (!d) return;
+  publicIP = d;
+  renderConnections();
+  const bad = (d.results || []).filter((r) => r.error).length;
+  if (bad) toast("warn", "Checked. " + bad + " uplink(s) could not reach the echo service.");
+  else toast("ok", "Public IPs resolved for " + ((d.results || []).length) + " uplink(s).");
+}
+
+// togglePublicIPMask flips the placeholder view and persists it across reloads.
+function togglePublicIPMask() {
+  publicIPMasked = !publicIPMasked;
+  try { localStorage.setItem("netmerge.pubip.masked", publicIPMasked ? "1" : "0"); } catch (e) { /* storage may be blocked */ }
+  syncMaskButton();
+  renderConnections();
+}
+
+function syncMaskButton() {
+  const b = $("#pubIPMask");
+  if (!b) return;
+  // The label states what clicking does, so the choice is never ambiguous on a recording.
+  b.textContent = publicIPMasked ? "Show public IPs" : "Mask public IPs";
+  b.setAttribute("aria-pressed", publicIPMasked ? "true" : "false");
+}
+
 function renderConnections() {
   const body = $("#connBody");
   const snap = state && state.snapshot;
@@ -516,6 +577,18 @@ function renderConnections() {
   if (cc) cc.textContent = adapters.length
     ? adapters.length + " adapter" + (adapters.length === 1 ? "" : "s") + " · " + eligibleCount(snap) + " eligible for bonding"
     : "";
+
+  const note = $("#pubIPNote");
+  clear(note);
+  if (publicIP) {
+    const failed = (publicIP.results || []).filter((r) => r.error);
+    note.append(h("div", { class: "notice info small", style: "margin-bottom:12px" },
+      "Public IPs from ", h("b", {}, publicIP.endpoint),
+      " — asked once when you clicked the button, over a socket pinned to each uplink.",
+      publicIPMasked ? " Currently masked for recording." : "",
+      failed.length ? h("div", { class: "small", style: "color:var(--warn);margin-top:4px" },
+        failed.length + " uplink(s) did not answer: " + failed.map((r) => r.name).join(", ")) : null));
+  }
 
   clear(body);
   if (!adapters.length) {
@@ -552,6 +625,8 @@ function adapterCard(a) {
     h("div", { class: "arate" }, h("div", { class: "rk" }, "link speed"), h("div", { class: "rv" }, a.speedBps ? rateShort(a.speedBps) : "—", a.speedBps ? h("span", { class: "tiny dim" }, " bit/s") : null)),
   );
 
+  const pub = publicIPFor(a.name);
+
   const cardEl = h("div", { class: "acard" + (excluded ? " excluded" : "") },
     h("div", { class: "ahead" },
       h("div", { class: "grow" },
@@ -560,6 +635,11 @@ function adapterCard(a) {
       h("button", { class: "btn ghost sm", onclick: () => { toggleAdapter(a.name); } }, open ? "▾ Hide" : "▸ Detail")),
     chips,
     rates,
+    pub ? h("div", { class: "small", style: "margin-top:8px" },
+      h("span", { class: "dim" }, "Public IP "),
+      pub.error
+        ? h("span", { style: "color:var(--warn)" }, "unreachable over this uplink")
+        : h("b", { style: publicIPMasked ? "letter-spacing:1px" : "" }, maskIP(pub.ip))) : null,
     h("div", { class: "small dim mt" }, a.link || "link state unknown",
       a.exclusion ? h("div", { class: "small", style: "color:var(--warn);margin-top:3px" }, a.exclusion) : null),
     open ? adapterDetail(a) : null,
@@ -577,6 +657,12 @@ function adapterDetail(a) {
   const pairs = [];
   pairs.push(["IPv4", a.ipv4 && a.ipv4.length ? a.ipv4.map((x) => x.address + (x.prefixLength ? "/" + x.prefixLength : "")).join(", ") : "—"]);
   pairs.push(["IPv6", a.ipv6 && a.ipv6.length ? a.ipv6.map((x) => x.address + (x.prefixLength ? "/" + x.prefixLength : "")).join(", ") : "—"]);
+  const pub = publicIPFor(a.name);
+  if (pub) {
+    pairs.push(["Public IP", pub.error
+      ? h("span", { style: "color:var(--warn)" }, "not reachable over this uplink")
+      : h("b", { style: publicIPMasked ? "letter-spacing:1px" : "" }, maskIP(pub.ip))]);
+  }
   if (a.gateways4 && a.gateways4.length) pairs.push(["Gateway v4", a.gateways4.join(", ")]);
   if (a.gateways6 && a.gateways6.length) pairs.push(["Gateway v6", a.gateways6.join(", ")]);
   if (a.dns4 && a.dns4.length) pairs.push(["DNS v4", a.dns4.join(", ")]);
@@ -775,14 +861,17 @@ function renderTTL() {
   const rep = ttlReport;
   if (st) {
     const caps = rep.capabilities || {};
-    st.textContent = caps.platform ? (caps.platform + " · " + (caps.supported ? "changes supported here" : "read-only: no supported write mechanism on this host")) : "";
+    st.textContent = caps.platform ? (caps.platform + " · " + (caps.supported ? "changes supported here" : (caps.readable ? "read-only: values are live, but no write mechanism on this host" : "no readable source on this host"))) : "";
   }
 
   if (rep.warnings && rep.warnings.length) {
     rep.warnings.forEach((w) => body.append(h("div", { class: "notice warn" }, w)));
   }
-  if (!rep.capabilities || !rep.capabilities.supported) {
-    body.append(h("div", { class: "notice info" }, "This host exposes no supported mechanism for writing packet TTL / hop limit, so values are shown read-only.",
+  if (!rep.capabilities || !rep.capabilities.readable) {
+    body.append(h("div", { class: "notice info" }, "This host exposes no readable source for packet TTL / hop limit, so no current values are shown.",
+      rep.capabilities && rep.capabilities.notes ? h("ul", null, rep.capabilities.notes.map((n) => h("li", null, n))) : null));
+  } else if (!rep.capabilities.supported) {
+    body.append(h("div", { class: "notice info" }, "Current values are read live from this host and shown below. Changing packet TTL / hop limit is a Windows feature in this build, so the controls here are read-only and nothing on this host is modified.",
       rep.capabilities && rep.capabilities.notes ? h("ul", null, rep.capabilities.notes.map((n) => h("li", null, n))) : null));
   }
 
@@ -792,8 +881,13 @@ function renderTTL() {
 
   // ---- header controls ----
   const header = h("div", { class: "panel" });
-  header.append(h("h3", null, "Apply a change", h("span", { class: "hint" }, "preview with a dry run first; nothing is written without confirmation")));
   const caps = rep.capabilities || {};
+  const canWriteAny = (rep.settings || []).some((s) => s.writable);
+  // On a host with no write mechanism the section must not promise an action it cannot perform:
+  // the heading says what is actually being shown instead of "Apply a change".
+  header.append(canWriteAny
+    ? h("h3", null, "Apply a change", h("span", { class: "hint" }, "preview with a dry run first; nothing is written without confirmation"))
+    : h("h3", null, "Current values", h("span", { class: "hint" }, "read live from this host; changing them is not available here")));
 
   // v4 card
   const v4sys = (rep.settings || []).find((s) => s.family === "ipv4" && s.scope === "system-global");
@@ -801,16 +895,19 @@ function renderTTL() {
   header.append(ttlControlCard("IPv4 TTL", "ipv4", v4sys, caps));
   header.append(ttlControlCard("IPv6 hop limit", "ipv6", v6sys, caps));
 
-  // preview / confirm / restore actions
-  const actions = h("div", { class: "row spread mt" });
-  const stagedAny = ttlStaged.ipv4 !== null || ttlStaged.ipv6 !== null;
-  actions.append(
-    h("div", { class: "small dim" }, stagedAny ? "You have unsaved, unapplied target values." : "No change staged. Pick a preset or type a custom value above."),
-    h("div", { class: "row tight" },
-      h("button", { class: "btn", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, true) }, "Preview (dry run)"),
-      h("button", { class: "btn primary", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, false) }, "Apply change"),
-      h("button", { class: "btn secondary", onclick: (e) => ttlRestore(e.target, false) }, "Restore captured originals")));
-  header.append(actions);
+  // preview / confirm / restore actions — hidden entirely on a read-only host, since staging a
+  // value there would be a dead end (the manager refuses every write).
+  if (canWriteAny) {
+    const actions = h("div", { class: "row spread mt" });
+    const stagedAny = ttlStaged.ipv4 !== null || ttlStaged.ipv6 !== null;
+    actions.append(
+      h("div", { class: "small dim" }, stagedAny ? "You have unsaved, unapplied target values." : "No change staged. Pick a preset or type a custom value above."),
+      h("div", { class: "row tight" },
+        h("button", { class: "btn", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, true) }, "Preview (dry run)"),
+        h("button", { class: "btn primary", disabled: !stagedAny, onclick: (e) => ttlApply(e.target, false) }, "Apply change"),
+        h("button", { class: "btn secondary", onclick: (e) => ttlRestore(e.target, false) }, "Restore captured originals")));
+    header.append(actions);
+  }
   body.append(header);
 
   // ---- read-back: per-interface + non-settings ----
@@ -835,40 +932,55 @@ function renderTTL() {
 
 function ttlControlCard(title, key, setting, caps) {
   const card = h("div", { class: "ttl-card", style: "margin-top:12px" });
-  const supported = caps && caps.supported && setting && setting.writable;
+  const readable = !!(caps && caps.readable);
+  const supported = readable && !!(caps && caps.supported) && !!(setting && setting.writable);
   const cur = setting ? setting.value : null;
   const origin = setting ? setting.valueOrigin : null;
   const staged = ttlStaged[key];
 
+  // What to show for "current" when there is no number. A readable host with no value means the
+  // OS's built-in default applies; a host with no read source must not claim that, because we
+  // never actually looked.
+  const curText = cur !== null && cur !== undefined ? String(cur)
+    : (readable ? "default" : "unknown");
+  const curIsUnknown = cur === null || cur === undefined;
+
   card.append(h("div", { class: "tt" },
     h("div", { class: "tname" }, title, " ", h("span", { class: "scope-badge system" }, "system-wide")),
-    setting && !setting.writable && setting.writableReason ? badge("read-only", "warn") : null));
+    !readable ? badge("not readable here", "warn")
+      : (setting && !setting.writable ? badge("read-only", "warn") : null)));
 
   const vals = h("div", { class: "ttl-vals" });
   vals.append(
-    h("div", null, h("div", { class: "lbl" }, "current"), h("div", { class: "cur" + (cur === null ? " def" : "") }, cur === null ? "default" : String(cur))),
-    h("div", null, h("div", { class: "lbl" }, "target"), h("div", { class: "cur" + (staged === null ? " def" : ""), style: staged !== null ? "color:var(--accent2)" : "" }, staged === null ? "—" : String(staged))),
+    h("div", null, h("div", { class: "lbl" }, "current"),
+      h("div", { class: "cur" + (curIsUnknown ? " def" : "") }, curText)),
+    h("div", null, h("div", { class: "lbl" }, "target"),
+      h("div", { class: "cur" + (staged === null ? " def" : ""), style: staged !== null ? "color:var(--accent2)" : "" }, staged === null ? "—" : String(staged))),
   );
   if (staged !== null && staged !== cur) {
-    vals.append(h("div", { class: "ttl-diff" }, h("span", { class: "from" }, cur === null ? "default" : String(cur)),
+    vals.append(h("div", { class: "ttl-diff" }, h("span", { class: "from" }, curIsUnknown ? "default" : String(cur)),
       h("span", { class: "arrow" }, "→"), h("span", { class: "to" }, String(staged))));
   }
   card.append(vals);
-  card.append(h("div", { class: "tiny faint" }, origin ? ("source: " + origin) : (cur === null ? "not explicitly configured — the OS built-in default is in use" : "")));
+  card.append(h("div", { class: "tiny faint" },
+    origin ? ("source: " + origin)
+      : (readable ? "not explicitly configured — the OS built-in default is in use" : "no readable source on this host, so the current value was not shown")));
 
-  // presets + custom
-  const presetRow = h("div", { class: "preset-row" });
-  TTL_PRESETS.forEach((p) => {
-    const on = String(staged) === p.key || (staged === null && String(cur) === p.key);
-    presetRow.append(h("button", { class: "preset" + (on ? " active" : ""), title: p.note, onclick: () => { ttlStaged[key] = Number(p.key); renderTTL(); } }, p.label));
-  });
-  const custom = h("input", { type: "number", min: 1, max: 255, value: staged !== null ? staged : "", placeholder: "custom", style: "width:80px", onchange: (e) => { const n = Number(e.target.value); ttlStaged[key] = isFinite(n) && n >= 1 && n <= 255 ? n : null; renderTTL(); } });
-  presetRow.append(h("span", { class: "tiny faint", style: "align-self:center" }, "or"), custom, h("span", { class: "tiny faint", style: "align-self:center" }, "1–255"));
-  card.append(presetRow);
-
-  if (!supported) {
+  // presets + custom — only when this value can actually be changed, so a read-only host never
+  // offers staging controls that would go nowhere.
+  if (supported) {
+    const presetRow = h("div", { class: "preset-row" });
+    TTL_PRESETS.forEach((p) => {
+      const on = String(staged) === p.key || (staged === null && String(cur) === p.key);
+      presetRow.append(h("button", { class: "preset" + (on ? " active" : ""), title: p.note, onclick: () => { ttlStaged[key] = Number(p.key); renderTTL(); } }, p.label));
+    });
+    const custom = h("input", { type: "number", min: 1, max: 255, value: staged !== null ? staged : "", placeholder: "custom", style: "width:80px", onchange: (e) => { const n = Number(e.target.value); ttlStaged[key] = isFinite(n) && n >= 1 && n <= 255 ? n : null; renderTTL(); } });
+    presetRow.append(h("span", { class: "tiny faint", style: "align-self:center" }, "or"), custom, h("span", { class: "tiny faint", style: "align-self:center" }, "1–255"));
+    card.append(presetRow);
+  } else {
     card.append(h("div", { class: "tiny", style: "color:var(--warn);margin-top:8px" },
-      setting && setting.writableReason ? setting.writableReason : "This value cannot be changed on this host."));
+      setting && setting.writableReason ? setting.writableReason
+        : (readable ? "This value cannot be changed on this host." : "This value could not be read on this host.")));
   }
   return card;
 }
@@ -879,7 +991,9 @@ function perIfaceTable(rows) {
   const body = h("tbody");
   rows.forEach((s) => body.append(h("tr", null,
     h("td", null, s.interface || "—"), h("td", null, s.family || "—"),
-    h("td", { class: "num" }, s.value === null || s.value === undefined ? h("span", { class: "dim" }, "default") : String(s.value)),
+    h("td", { class: "num" }, s.value === null || s.value === undefined
+      ? h("span", { class: "dim" }, s.writable ? "default" : "unknown")
+      : String(s.value)),
     h("td", { class: "small dim" }, s.valueOrigin || "—"),
     h("td", null, s.writable ? badge("yes", "ok") : badge("no", "warn")))));
   t.append(body);
@@ -1617,6 +1731,8 @@ document.querySelectorAll("#nav button, #nav2 button").forEach((b) => b.addEvent
 
 $("#ovRefresh").addEventListener("click", (e) => guard(async () => { state = await api("/api/refresh", { method: "POST", body: {} }); renderAll(); toast("ok", "Snapshot refreshed."); }, e.target));
 $("#connRefresh").addEventListener("click", (e) => guard(async () => { state = await api("/api/refresh", { method: "POST", body: {} }); renderAll(); toast("ok", "Snapshot refreshed."); }, e.target));
+$("#pubIPCheck").addEventListener("click", (e) => checkPublicIPs(e.target));
+$("#pubIPMask").addEventListener("click", () => togglePublicIPMask());
 $("#ttlReload").addEventListener("click", (e) => loadTTL(e.target));
 $("#diagRunAll").addEventListener("click", (e) => runDiag(true, e.target));
 $("#diagRunSel").addEventListener("click", (e) => runDiag(false, e.target));
@@ -1645,6 +1761,7 @@ $("#settingsSave").addEventListener("click", (e) => saveSettings(e.target));
 // original boot
 (async function boot() {
   await loadCodeRegistry();
+  syncMaskButton(); // reflect the persisted mask choice before anything renders
   renderFooter();
   stateLoop();
   const footTimer = setInterval(() => { if (state) { renderFooter(); } }, 5000);
