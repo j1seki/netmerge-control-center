@@ -120,9 +120,15 @@ func RelaunchTray(args []string, hidden bool) error {
 			"  sudo %q run\n"+
 			"`sudo net-merge run` works without the tray", img, img)
 	}
-	return errors.New("the tray needs CAP_NET_ADMIN. Grant it once with:\n" +
+	// The tray must run as the user (so it can reach the session's StatusNotifierWatcher) while
+	// holding CAP_NET_ADMIN in its effective set. File capabilities grant exactly that: the on-disk
+	// binary keeps the cap, and a non-root launch runs the tray in place with no elevation relaunch.
+	// Do NOT `sudo tray` -- a root process cannot see the user's D-Bus, so no icon would ever show.
+	return errors.New("the tray needs CAP_NET_ADMIN granted to the on-disk binary, then run as your\n" +
+		"user (never under sudo -- root cannot reach the desktop tray host, so no icon appears).\n" +
 		"  sudo setcap cap_net_admin,cap_net_raw+ep " + exe + "\n" +
-		"`sudo net-merge run` works without it")
+		"  " + exe + "          # as your user: tray icon appears, then \"Open Control Center\"\n" +
+		"`sudo net-merge run` starts the engine headless (no tray icon) without any capability")
 }
 
 // HasConsole reports whether stderr is a terminal.

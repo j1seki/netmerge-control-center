@@ -4,7 +4,10 @@ package tray
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -25,7 +28,7 @@ func Run(t *tun.Tun, sched *engine.Scheduler, bal *engine.Balancer, stateDir str
 	ui := &trayUI{tun: t, sched: sched, bal: bal, stateDir: stateDir, startOn: startOn,
 		iconOn: icon.Tray(true), iconOff: icon.Tray(false), ready: ready}
 	ui.ap.enabled = autoPause
-	exit := func() { t.Close(); state.Clear(stateDir) }
+	exit := func() { ui.stopControlCenter(); t.Close(); state.Clear(stateDir) }
 	systray.Run(ui.onReady, exit)
 	exit() // macOS's Run returns on Quit without calling onExit; both are idempotent
 }
@@ -42,14 +45,17 @@ type trayUI struct {
 
 	ap autoPauser
 
-	header, toggleItem, v6Item, autoItem *systray.MenuItem
-	rows                                 []*systray.MenuItem
-	lastOn                               *bool
-	lastHeader                           string
-	lastTip                              string
-	lastRows                             [trayRows]string
-	lastErr                              string
-	busyUntil                            time.Time
+	header, openItem, toggleItem, v6Item, autoItem *systray.MenuItem
+	rows                                           []*systray.MenuItem
+	lastOn                                         *bool
+	lastHeader                                     string
+	lastTip                                        string
+	lastRows                                       [trayRows]string
+	lastErr                                        string
+	busyUntil                                      time.Time
+
+	mu   sync.Mutex // guards dash: clicked by the menu goroutine, stopped by the exit path
+	dash *exec.Cmd  // the Control Center (`dashboard`) process, if one is open
 }
 
 func (u *trayUI) onReady() {
@@ -68,6 +74,7 @@ func (u *trayUI) onReady() {
 		u.rows = append(u.rows, r)
 	}
 	systray.AddSeparator()
+	u.openItem = systray.AddMenuItem("Open Control Center", "Opens the browser dashboard: per-adapter speeds, diagnostics, the TTL manager and the redacted export.")
 	u.v6Item = systray.AddMenuItemCheckbox("Use all adapters (IPv6 only if every adapter has it)", "Ticked: apps are pushed to IPv4 so every adapter is used. Unticked: IPv6 is allowed and funnels onto the adapters that have it.", u.bal.V6Mode() == engine.V6Auto)
 	u.autoItem = systray.AddMenuItemCheckbox("Pause when there is only one connection", "Pauses merging by itself when fewer than two connections have internet, and starts it again when a second one works. Pausing or starting by hand always wins.", u.ap.enabled)
 	u.toggleItem = systray.AddMenuItem("Start merging", "")
@@ -108,6 +115,8 @@ func (u *trayUI) onReady() {
 					u.v6Item.Check()
 					u.bal.SetV6Mode(engine.V6Auto)
 				}
+			case <-u.openItem.ClickedCh:
+				u.openControlCenter()
 			case <-quit.ClickedCh:
 				systray.Quit()
 				return
@@ -177,6 +186,43 @@ func (u *trayUI) turn(on bool) {
 	if err := u.tun.On(); err != nil {
 		u.lastErr = err.Error()
 		logx.Printf("error: %v\n", err)
+	}
+}
+
+// openControlCenter opens (or reopens) the browser dashboard: it runs this same binary as
+// `dashboard -open`, which starts a fresh loopback server and launches the default browser.
+// Only one Control Center is kept at a time, so clicking again replaces the previous one.
+func (u *trayUI) openControlCenter() {
+	u.stopControlCenter()
+	exe, err := os.Executable()
+	if err != nil {
+		logx.Printf("error: could not open the Control Center: %v\n", err)
+		return
+	}
+	cmd := exec.Command(exe, "dashboard", "-open")
+	// Hand the page's banner (its URL) to whatever stdout/stderr we have -- a terminal when the
+	// tray was started from one, so the address is still visible if no browser could be opened.
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		logx.Printf("error: could not open the Control Center: %v\n", err)
+		return
+	}
+	go cmd.Wait() // reap it when it exits, so it never lingers as a zombie
+	u.mu.Lock()
+	u.dash = cmd
+	u.mu.Unlock()
+	logx.Eventf(logx.LevelInfo, "cc.tray", "Control Center opened")
+}
+
+// stopControlCenter closes a Control Center opened from the tray, if one is still running.
+// It is idempotent and safe to call on shutdown.
+func (u *trayUI) stopControlCenter() {
+	u.mu.Lock()
+	cmd := u.dash
+	u.dash = nil
+	u.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill() // SIGKILL: the dashboard is stateless, so nothing is lost
 	}
 }
 
