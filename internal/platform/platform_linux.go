@@ -106,6 +106,20 @@ func RelaunchTray(args []string, hidden bool) error {
 		return errors.New("the tray needs CAP_NET_ADMIN: enable programs.net-merge in your NixOS configuration " +
 			"and run /run/wrappers/bin/net-merge (see README). `sudo net-merge run` works without it")
 	}
+	// An AppImage mounts to a fresh tmpfs on every run, so `setcap` on the extracted binary
+	// cannot stick -- and the tray also needs the desktop session's D-Bus, which a root process
+	// cannot reach. Point at the dashboard plus a separate `run` instead of a doomed setcap.
+	if img := os.Getenv("APPIMAGE"); img != "" || strings.Contains(exe, "/.mount_") {
+		if img == "" {
+			img = exe
+		}
+		return fmt.Errorf("the tray needs CAP_NET_ADMIN, which an AppImage cannot carry on its "+
+			"transient mount. Open the Control Center dashboard instead:\n"+
+			"  %q dashboard\n"+
+			"then start the engine once with:\n"+
+			"  sudo %q run\n"+
+			"`sudo net-merge run` works without the tray", img, img)
+	}
 	return errors.New("the tray needs CAP_NET_ADMIN. Grant it once with:\n" +
 		"  sudo setcap cap_net_admin,cap_net_raw+ep " + exe + "\n" +
 		"`sudo net-merge run` works without it")

@@ -13,10 +13,12 @@ name: build
 # macos (universal) and windows. Nothing here downloads or runs a binary
 # from outside this repository — no package managers, no installers.
 #
-# The GUI tray is built for every OS: Windows ships a windowless
-# net-merge-tray.exe, the Linux AppImage launches the tray by default, and
-# the macOS universal binary defaults to the tray. All three still run the
-# normal CLI subcommands when you pass them as arguments.
+# A GUI ships for every OS. Windows and macOS use the system tray (a windowless
+# net-merge-tray.exe, and a macOS binary that defaults to the tray). The Linux
+# AppImage instead opens the Control Center dashboard in a browser, because a
+# portable AppImage cannot carry the CAP_NET_ADMIN a tray-engine needs while also
+# reaching the desktop session. All of them still run the normal CLI subcommands
+# when you pass them as arguments.
 
 on:
   workflow_dispatch:
@@ -92,20 +94,39 @@ jobs:
           go vet ./...
           mkdir -p AppDir
           go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o AppDir/net-merge ./cmd/net-merge
-      - name: Assemble AppDir (GUI tray by default)
+      - name: Assemble AppDir (Control Center GUI by default)
         shell: bash
         run: |
-          # Launch the tray with no arguments, and pass any arguments
-          # straight through to the normal CLI, so the one file is both a
-          # double-clickable GUI app and a fully working command line tool.
+          # With no arguments, open the Control Center dashboard -- a browser
+          # page that works for any user on any desktop, unlike a system-tray
+          # icon (which needs a desktop tray host plus CAP_NET_ADMIN that a
+          # portable AppImage cannot carry on its own). Arguments pass straight
+          # through to the CLI. When launched with sudo, also run the privileged
+          # bonding engine so the page can drive it.
           cat > AppDir/AppRun <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
+          BIN="$HERE/net-merge"
+
           if [ $# -eq 0 ]; then
-            exec "$HERE/net-merge" tray
-          else
-            exec "$HERE/net-merge" "$@"
+            # No arguments: show the GUI. It is a browser page, so it works for
+            # any user on any desktop -- unlike a system-tray icon it needs no
+            # desktop tray host and no privilege merely to be shown.
+            #
+            # The bonding engine is privileged, and a portable AppImage cannot
+            # carry CAP_NET_ADMIN on its own. If this launch already holds that
+            # privilege (you used `sudo`) also start the engine so the page can
+            # drive it; a Ctrl+C in this terminal then stops both, each cleaning
+            # up after itself. Otherwise only the dashboard opens -- start the
+            # engine once with:  sudo "<this AppImage>" run
+            if [ "$(id -u)" -eq 0 ]; then
+              "$BIN" run &
+              exec "$BIN" dashboard -no-open
+            fi
+            exec "$BIN" dashboard -open
           fi
+
+          exec "$BIN" "$@"
           EOF
           chmod +x AppDir/AppRun
           cat > AppDir/net-merge.desktop <<'EOF'
@@ -241,9 +262,9 @@ jobs:
           cat > "$notes" <<'EOF'
           Portable binaries built by the `build` workflow. Nothing here is code-signed.
 
-          **GUI tray on every OS** — double-click to open the tray:
-          * **Windows** — `net-merge-tray.exe` (windowless). `net-merge.exe` is the plain CLI.
-          * **Linux** — `net-merge-x86_64.AppImage` launches the tray. Run `./net-merge-x86_64.AppImage <subcommand>` for the CLI. Needs a desktop with a system tray; the AppImage itself needs FUSE (libfuse2) installed on most distros.
+          **A GUI on every OS:**
+          * **Windows** — `net-merge-tray.exe` (windowless tray; double-click it). `net-merge.exe` is the plain CLI.
+          * **Linux** — `net-merge-x86_64.AppImage` opens the **Control Center dashboard** in your browser (no system tray required). To actually bond, start the privileged engine first with `sudo "./net-merge-x86_64.AppImage" run`; the dashboard then turns it on and off. Run `./net-merge-x86_64.AppImage <subcommand>` for the CLI. The AppImage itself needs FUSE (libfuse2) on most distros.
           * **macOS** — the universal binary opens the tray when run with no arguments. Pass a subcommand for the CLI. Ad-hoc signed only; on first run use *System Settings → Privacy & Security → Open Anyway*.
 
           **CLI / headless:**
