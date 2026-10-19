@@ -2,3 +2,6 @@
 wintun.dll
 dist/
 result
+
+# Local download of CI build artifacts (three-OS binaries); never committed.
+release/
