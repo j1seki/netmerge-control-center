@@ -1,0 +1,97 @@
+name: build
+# Build the three desktop OS binaries and attach them to this run as downloadable artifacts.
+# Trigger by hand (Actions -> build -> Run workflow); it builds, it does not publish a release.
+#
+# Linux and Windows are pure Go, so one job builds every target with cross-compilation. macOS is
+# different: fyne.io/systray is cgo there, so it needs a real macOS runner with Apple's SDK — a
+# Linux host cannot produce it. That is why the macOS job runs on macos-latest and lipo-merges the
+# two CPU slices into one universal binary, exactly as scripts/build.ps1 and release.yml do.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-windows:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64, suffix: ""}
+          - {goos: linux, goarch: arm64, suffix: ""}
+          - {goos: windows, goarch: amd64, suffix: ".exe"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and test
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          v=0.1.0
+          base="net-merge-$GOOS-$GOARCH"
+          go build -trimpath -ldflags "-s -w -X main.version=$v" \
+            -o "${base}/net-merge${{ matrix.suffix }}" ./cmd/net-merge
+          # Windows also ships the windowless tray build, which defaults to `tray` on launch.
+          if [ "$GOOS" = windows ]; then
+            go build -trimpath -ldflags "-s -w -H=windowsgui -X main.defaultCmd=tray -X main.version=$v" \
+              -o "${base}/net-merge-tray.exe" ./cmd/net-merge
+          fi
+          cp LICENSE THIRD-PARTY-NOTICES.md "${base}/"
+          if [ "$GOOS" = windows ]; then
+            zip -qry "${base}.zip" "${base}"
+            echo "ASSET=${base}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${base}.tar.gz" "${base}"
+            echo "ASSET=${base}.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and test
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2/32
+          sudo ifconfig lo0 alias 127.0.0.3/32
+          go vet ./...
+          go test ./...
+      - name: Build universal binary
+        run: |
+          v=0.1.0
+          for arch in arm64 amd64; do
+            CGO_ENABLED=1 GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$v" \
+              -o "net-merge-$arch" ./cmd/net-merge
+          done
+          mkdir -p "net-merge-macos-universal"
+          lipo -create -output "net-merge-macos-universal/net-merge" net-merge-arm64 net-merge-amd64
+          # lipo invalidates the per-arch signatures, so sign ad-hoc.
+          codesign --force --sign - "net-merge-macos-universal/net-merge"
+          cp LICENSE THIRD-PARTY-NOTICES.md "net-merge-macos-universal/"
+          tar -czf net-merge-macos-universal.tar.gz net-merge-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-merge-macos-universal.tar.gz
+          path: net-merge-macos-universal.tar.gz
+          if-no-files-found: error
