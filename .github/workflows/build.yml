@@ -27,14 +27,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Vet and test
+      - name: Vet (cross-compiles for the target; does not execute anything)
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: |
-          go vet ./...
-          go test ./...
+        run: go vet ./...
+      # go test must run natively: a cross-compiled test binary cannot be executed on this runner
+      # (that would be an "exec format error"). The ubuntu-latest runner is linux/amd64, so only
+      # that leg runs the suite; every leg still gets vet + a full cross-compile in Build below.
+      - name: Test (linux/amd64 runner only)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test ./...
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
