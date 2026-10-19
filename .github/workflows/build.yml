@@ -1,101 +1,270 @@
 name: build
-# Build the three desktop OS binaries and attach them to this run as downloadable artifacts.
-# Trigger by hand (Actions -> build -> Run workflow); it builds, it does not publish a release.
+
+# Manual cross-platform build that produces release-ready binaries and
+# publishes them to a GitHub Release. Run it from the Actions tab.
 #
-# Linux and Windows are pure Go, so one job builds every target with cross-compilation. macOS is
-# different: fyne.io/systray is cgo there, so it needs a real macOS runner with Apple's SDK — a
-# Linux host cannot produce it. That is why the macOS job runs on macos-latest and lipo-merges the
-# two CPU slices into one universal binary, exactly as scripts/build.ps1 and release.yml do.
+#   tag (input)  Release tag to publish under. A release is created (or its
+#                assets refreshed) on every run, so re-running after a fix
+#                simply replaces the files. Leave the default for v0.1.0.
+#
+# Every leg cross-checks with `go vet` (compiles without executing) so a
+# Windows/arm64-only compile error still fails loudly. The real `go test`
+# runs on the legs that can execute their own binaries: linux/amd64,
+# macos (universal) and windows. Nothing here downloads or runs a binary
+# from outside this repository — no package managers, no installers.
+#
+# The GUI tray is built for every OS: Windows ships a windowless
+# net-merge-tray.exe, the Linux AppImage launches the tray by default, and
+# the macOS universal binary defaults to the tray. All three still run the
+# normal CLI subcommands when you pass them as arguments.
+
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish under"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: read
 
 jobs:
-  linux-windows:
+  linux:
+    name: linux
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {goos: linux, goarch: amd64, suffix: ""}
-          - {goos: linux, goarch: arm64, suffix: ""}
-          - {goos: windows, goarch: amd64, suffix: ".exe"}
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Vet (cross-compiles for the target; does not execute anything)
+      - name: Cross-vet ${{ matrix.arch }}
+        shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
         run: go vet ./...
-      # go test must run natively: a cross-compiled test binary cannot be executed on this runner
-      # (that would be an "exec format error"). The ubuntu-latest runner is linux/amd64, so only
-      # that leg runs the suite; every leg still gets vet + a full cross-compile in Build below.
-      - name: Test (linux/amd64 runner only)
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: go test ./...
-      - name: Build
+      - name: Build and test ${{ matrix.arch }} (amd64 only)
+        shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          if [ "$GOARCH" = "amd64" ]; then
+            gofmt -l . | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
+            go test ./... -count=1 -race
+          fi
+      - name: Build ${{ matrix.arch }} binary
+        shell: bash
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: "0"
         run: |
-          v=0.1.0
-          base="net-merge-$GOOS-$GOARCH"
-          go build -trimpath -ldflags "-s -w -X main.version=$v" \
-            -o "${base}/net-merge${{ matrix.suffix }}" ./cmd/net-merge
-          # Windows also ships the windowless tray build, which defaults to `tray` on launch.
-          if [ "$GOOS" = windows ]; then
-            go build -trimpath -ldflags "-s -w -H=windowsgui -X main.defaultCmd=tray -X main.version=$v" \
-              -o "${base}/net-merge-tray.exe" ./cmd/net-merge
-          fi
-          cp LICENSE THIRD-PARTY-NOTICES.md "${base}/"
-          if [ "$GOOS" = windows ]; then
-            zip -qry "${base}.zip" "${base}"
-            echo "ASSET=${base}.zip" >> "$GITHUB_ENV"
-          else
-            tar -czf "${base}.tar.gz" "${base}"
-            echo "ASSET=${base}.tar.gz" >> "$GITHUB_ENV"
-          fi
-      - uses: actions/upload-artifact@v4
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o dist/net-merge ./cmd/net-merge
+          cp LICENSE THIRD-PARTY-NOTICES.md dist/
+          tar czf dist/net-merge-linux-${{ matrix.arch }}.tar.gz -C dist net-merge LICENSE THIRD-PARTY-NOTICES.md
+          rm -f dist/net-merge dist/LICENSE dist/THIRD-PARTY-NOTICES.md
+      - name: Upload ${{ matrix.arch }}
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ASSET }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
+          name: net-merge-linux-${{ matrix.arch }}.tar.gz
+          path: dist/net-merge-linux-${{ matrix.arch }}.tar.gz
+
+  appimage:
+    name: appimage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and build static binary
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          mkdir -p AppDir
+          go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o AppDir/net-merge ./cmd/net-merge
+      - name: Assemble AppDir (GUI tray by default)
+        shell: bash
+        run: |
+          # Launch the tray with no arguments, and pass any arguments
+          # straight through to the normal CLI, so the one file is both a
+          # double-clickable GUI app and a fully working command line tool.
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          if [ $# -eq 0 ]; then
+            exec "$HERE/net-merge" tray
+          else
+            exec "$HERE/net-merge" "$@"
+          fi
+          EOF
+          chmod +x AppDir/AppRun
+          cat > AppDir/net-merge.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=net-merge
+          Comment=Use all your network adapters at once
+          Exec=net-merge
+          Icon=net-merge
+          Categories=Network;
+          Terminal=false
+          EOF
+          cp docs/icon.png AppDir/net-merge.png
+      - name: Build AppImage
+        shell: bash
+        run: |
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # Extract-and-run avoids the FUSE requirement on the runner.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export ARCH=x86_64
+          ./appimagetool AppDir net-merge-x86_64.AppImage
+          file net-merge-x86_64.AppImage
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-merge-x86_64.AppImage
+          path: net-merge-x86_64.AppImage
+
+  windows:
+    name: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet amd64 + arm64
+        shell: bash
+        run: |
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+      - name: Build amd64 binaries
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o dist/net-merge.exe ./cmd/net-merge
+          go build -trimpath -ldflags "-s -w -H=windowsgui -X main.defaultCmd=tray" -o dist/net-merge-tray.exe ./cmd/net-merge
+          cp LICENSE THIRD-PARTY-NOTICES.md dist/
+          (
+            cd dist
+            zip -9 ../dist/net-merge-windows-amd64.zip net-merge.exe net-merge-tray.exe LICENSE THIRD-PARTY-NOTICES.md
+          )
+      - name: Upload amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-merge-windows-amd64.zip
+          path: dist/net-merge-windows-amd64.zip
 
   macos:
+    name: macos
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Vet and test
+      - name: Set up loopback aliases for the tests
+        shell: bash
         run: |
-          sudo ifconfig lo0 alias 127.0.0.2/32
-          sudo ifconfig lo0 alias 127.0.0.3/32
-          go vet ./...
-          go test ./...
-      - name: Build universal binary
-        run: |
-          v=0.1.0
-          for arch in arm64 amd64; do
-            CGO_ENABLED=1 GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$v" \
-              -o "net-merge-$arch" ./cmd/net-merge
+          set -x
+          sudo ifconfig lo0 alias 198.18.0.1 255.255.255.0
+          sudo ifconfig lo0 alias 198.18.0.2 255.255.255.0
+          for c in 1 2 3 4; do
+            sudo ifconfig lo0 alias 198.19.0.$c 255.255.255.0 || true
           done
-          mkdir -p "net-merge-macos-universal"
-          lipo -create -output "net-merge-macos-universal/net-merge" net-merge-arm64 net-merge-amd64
-          # lipo invalidates the per-arch signatures, so sign ad-hoc.
-          codesign --force --sign - "net-merge-macos-universal/net-merge"
-          cp LICENSE THIRD-PARTY-NOTICES.md "net-merge-macos-universal/"
-          tar -czf net-merge-macos-universal.tar.gz net-merge-macos-universal
-      - uses: actions/upload-artifact@v4
+      - name: Vet + test
+        shell: bash
+        run: |
+          gofmt -l . | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
+          go vet ./...
+          go test ./... -count=1 -race
+      - name: Build universal binary (GUI tray by default)
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p macos-arm64 macos-amd64 macos-universal
+          for pair in arm64:macos-arm64 amd64:macos-amd64; do
+            arch="${pair%%:*}"
+            out="${pair##*:}"
+            GOOS=darwin GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=0.1.0 -X main.defaultCmd=tray" \
+              -o "$out/net-merge" ./cmd/net-merge
+          done
+          lipo -create -output macos-universal/net-merge macos-arm64/net-merge macos-amd64/net-merge
+          codesign -s - macos-universal/net-merge
+          cp LICENSE THIRD-PARTY-NOTICES.md macos-universal/
+          tar czf net-merge-macos-universal.tar.gz -C macos-universal net-merge LICENSE THIRD-PARTY-NOTICES.md
+          file macos-universal/net-merge
+      - name: Upload universal
+        uses: actions/upload-artifact@v4
         with:
           name: net-merge-macos-universal.tar.gz
           path: net-merge-macos-universal.tar.gz
-          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [linux, appimage, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          ls -la dist
+
+          notes="$(mktemp)"
+          cat > "$notes" <<'EOF'
+          Portable binaries built by the `build` workflow. Nothing here is code-signed.
+
+          **GUI tray on every OS** — double-click to open the tray:
+          * **Windows** — `net-merge-tray.exe` (windowless). `net-merge.exe` is the plain CLI.
+          * **Linux** — `net-merge-x86_64.AppImage` launches the tray. Run `./net-merge-x86_64.AppImage <subcommand>` for the CLI. Needs a desktop with a system tray; the AppImage itself needs FUSE (libfuse2) installed on most distros.
+          * **macOS** — the universal binary opens the tray when run with no arguments. Pass a subcommand for the CLI. Ad-hoc signed only; on first run use *System Settings → Privacy & Security → Open Anyway*.
+
+          **CLI / headless:**
+          * `net-merge-linux-amd64.tar.gz`, `net-merge-linux-arm64.tar.gz` — static binaries for servers and containers.
+          * Every file is reproducible from source; see `IMPLEMENTATION_REPORT.md` for what was and was not physically verified.
+
+          SHA-256 checksums are published in `SHA256SUMS.txt`.
+          EOF
+
+          # Checksums for whichever files actually landed (exclude the file itself).
+          (
+            cd dist
+            rm -f SHA256SUMS.txt
+            sha256sum -- * > SHA256SUMS.txt
+          )
+
+          files=(dist/*)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+            gh release edit "$tag" --notes-file "$notes"
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "net-merge $tag" \
+              --notes-file "$notes"
+          fi
